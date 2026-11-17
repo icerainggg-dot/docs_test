@@ -1,0 +1,27 @@
+{
+  "name": "hwpx-coedit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HWPX 실시간 동시편집 프로그램 (rHWP + Yjs + Hocuspocus)",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.js",
+    "build": "vite build",
+    "start": "node server/index.js",
+    "test": "node --test \"test/unit/*.test.js\"",
+    "test:e2e": "node test/e2e/coedit.e2e.js"
+  },
+  "dependencies": {
+    "@hocuspocus/provider": "^4.8.0",
+    "@hocuspocus/server": "^4.8.0",
+    "@rhwp/core": "^0.9.0",
+    "express": "^5.3.0",
+    "yjs": "^13.6.33"
+  },
+  "devDependencies": {
+    "vite": "^8.3.8"
+  }
+}
