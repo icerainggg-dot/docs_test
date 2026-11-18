@@ -1,0 +1,15 @@
+{
+  // 서버·공통 코드·시험: Node 가 타입만 지우고 그대로 실행한다.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+    "composite": true,
+    "emitDeclarationOnly": true,
+    "noEmit": false,
+    "declarationDir": "node_modules/.cache/tsc/node",
+    "tsBuildInfoFile": "node_modules/.cache/tsc/node.tsbuildinfo"
+  },
+  "include": ["src/shared", "server", "test", "scripts", "web/src/editor/editor.ts"]
+}

@@ -9,7 +9,7 @@
 
 ## 실행
 
-Node.js 22 이상이 필요합니다.
+Node.js 22.18 이상이 필요합니다. 소스는 TypeScript이며, 서버는 Node가 타입만 지우고 그대로 실행하므로 서버 쪽 빌드 단계가 없습니다.
 
 ```bash
 npm install
@@ -57,22 +57,30 @@ Docker: `docker build -t hwpx-coedit . && docker run -p 8787:8787 -v hwpx-data:/
 
 | 경로 | 내용 |
 |---|---|
-| `src/shared/model.js` | Yjs 데이터 모델, 원본 문서 훑기, 초기 상태 만들기 |
-| `src/shared/ops.js` | 편집 연산 (모두 Yjs 연산) |
-| `src/shared/reconciler.js` | Yjs 상태 → rHWP 문서 맞추기 |
-| `src/shared/hwp-adapter.js` | rHWP API를 본문/표 셀 공통으로 감싼 어댑터 |
+| `src/shared/model.ts` | Yjs 데이터 모델, 원본 문서 훑기, 초기 상태 만들기 |
+| `src/shared/ops.ts` | 편집 연산 (모두 Yjs 연산) |
+| `src/shared/reconciler.ts` | Yjs 상태 → rHWP 문서 맞추기 |
+| `src/shared/hwp-adapter.ts` | rHWP API를 본문/표 셀 공통으로 감싸고, JSON 결과에 타입을 붙인 어댑터 |
 | `server/` | REST API, Hocuspocus 동기화, 저장 워커, 파일 저장소, WebDAV |
 | `web/` | 편집기 화면 (쪽 그리기, 커서, 입력 처리) |
 
-## 시험
+## 개발
 
-```bash
-npm test                          # 단위·통합 시험 (무작위 3인 동시편집 수렴 시험 포함)
-npm run build && npm run test:e2e # 브라우저 두 개로 실제 동시편집 (Playwright 필요)
-```
+| 명령 | 하는 일 |
+|---|---|
+| `npm run dev` | 서버(8787)와 Vite 개발 서버(5173)를 함께 실행 |
+| `npm run typecheck` | 전체 타입 검사 (서버·공통 코드·시험, 브라우저 코드를 각각 검사) |
+| `npm test` | 단위·통합 시험 (무작위 3인 동시편집 수렴 시험 포함) |
+| `npm run build && npm run test:e2e` | 브라우저 두 개로 실제 동시편집 (Playwright 필요) |
+
+TypeScript 설정은 두 갈래입니다.
+- `tsconfig.node.json`: 서버·공통 코드·시험. Node가 직접 실행하므로 `import`에 `.ts` 확장자를 쓰고, 실행 시 지울 수 없는 문법(`enum`, 생성자 매개변수 속성 등)은 쓰지 않습니다(`erasableSyntaxOnly`).
+- `tsconfig.web.json`: 브라우저 편집기. Vite가 묶습니다.
+
+공통 코드(`src/shared`)는 두 쪽에서 모두 검사되므로, 브라우저와 서버가 같은 모양의 데이터를 쓰는지 컴파일 단계에서 확인됩니다.
 
 시험 문서는 rHWP로 만든 견본입니다. 실제 업무 서식으로의 검증(계획의 0단계)은 아직 하지 않았습니다.
 
 ## 사용한 오픈소스
 
-rHWP `@rhwp/core` (MIT), Yjs (MIT), Hocuspocus (MIT), Express (MIT), Vite (MIT)
+rHWP `@rhwp/core` (MIT), Yjs (MIT), Hocuspocus (MIT), Express (MIT), Vite (MIT), TypeScript (Apache-2.0)

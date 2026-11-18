@@ -2,11 +2,17 @@
 import init, { HwpDocument } from '@rhwp/core';
 import wasmUrl from '@rhwp/core/rhwp_bg.wasm?url';
 
-let ready = null;
+declare global {
+  // rHWP 가 조판할 때 부르는 글자 폭 측정 함수
+  var measureTextWidth: ((font: string, text: string) => number) | undefined;
+}
 
-function installMeasure() {
+let ready: Promise<unknown> | null = null;
+
+function installMeasure(): void {
   const ctx = document.createElement('canvas').getContext('2d');
-  const cache = new Map();
+  if (!ctx) throw new Error('이 브라우저는 canvas 를 쓸 수 없습니다.');
+  const cache = new Map<string, number>();
   let lastFont = '';
   globalThis.measureTextWidth = (font, text) => {
     const key = font + '\u0000' + text;
@@ -24,7 +30,7 @@ function installMeasure() {
   };
 }
 
-export function initRhwp() {
+export function initRhwp(): Promise<unknown> {
   if (!ready) {
     installMeasure();
     ready = init({ module_or_path: wasmUrl });

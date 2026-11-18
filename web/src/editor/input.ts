@@ -1,11 +1,41 @@
 // 키보드·한글 입력기·마우스 입력을 편집 명령으로 바꾼다.
 
-export function bindInput(editor, view) {
+import type { Editor } from './editor.ts';
+import type { View } from './view.ts';
+
+export function bindInput(editor: Editor, view: View): void {
   const ta = view.input;
   const pagesEl = view.pagesEl;
   let composing = false;
 
-  const mod = (e) => e.ctrlKey || e.metaKey;
+  const mod = (e: KeyboardEvent): boolean => e.ctrlKey || e.metaKey;
+
+  /** Ctrl/⌘ 와 함께 누른 글쇠. 처리했으면 true. */
+  const shortcut = (e: KeyboardEvent): boolean => {
+    switch (e.key.toLowerCase()) {
+      case 'b':
+        editor.toggleFormat('b');
+        return true;
+      case 'i':
+        editor.toggleFormat('i');
+        return true;
+      case 'u':
+        editor.toggleFormat('u');
+        return true;
+      case 'z':
+        if (e.shiftKey) editor.redo();
+        else editor.undo();
+        return true;
+      case 'y':
+        editor.redo();
+        return true;
+      case 'a':
+        editor.selectAll();
+        return true;
+      default:
+        return false; // 복사·붙여넣기 등은 브라우저 기본 동작 → 아래 이벤트로 처리
+    }
+  };
 
   ta.addEventListener('keydown', (e) => {
     if (composing || e.isComposing || e.keyCode === 229) return;
@@ -45,33 +75,7 @@ export function bindInput(editor, view) {
         editor.type('\t');
         break;
       default:
-        handled = false;
-        if (mod(e) && !e.altKey) {
-          handled = true;
-          switch (e.key.toLowerCase()) {
-            case 'b':
-              editor.toggleFormat('b');
-              break;
-            case 'i':
-              editor.toggleFormat('i');
-              break;
-            case 'u':
-              editor.toggleFormat('u');
-              break;
-            case 'z':
-              if (shift) editor.redo();
-              else editor.undo();
-              break;
-            case 'y':
-              editor.redo();
-              break;
-            case 'a':
-              editor.selectAll();
-              break;
-            default:
-              handled = false; // 복사·붙여넣기 등은 브라우저 기본 동작 → 아래 이벤트로 처리
-          }
-        }
+        handled = mod(e) && !e.altKey && shortcut(e);
     }
     if (handled) e.preventDefault();
   });
@@ -89,7 +93,7 @@ export function bindInput(editor, view) {
     ta.value = '';
   });
   ta.addEventListener('input', (e) => {
-    if (composing || e.isComposing) return;
+    if (composing || (e as InputEvent).isComposing) return;
     const text = ta.value;
     ta.value = '';
     if (text) editor.type(text);
@@ -97,19 +101,19 @@ export function bindInput(editor, view) {
 
   ta.addEventListener('copy', (e) => {
     const text = editor.selectedText();
-    if (!text) return;
+    if (!text || !e.clipboardData) return;
     e.clipboardData.setData('text/plain', text);
     e.preventDefault();
   });
   ta.addEventListener('cut', (e) => {
     const text = editor.selectedText();
-    if (!text) return;
+    if (!text || !e.clipboardData) return;
     e.clipboardData.setData('text/plain', text);
     e.preventDefault();
     editor.deleteSelection();
   });
   ta.addEventListener('paste', (e) => {
-    const text = e.clipboardData.getData('text/plain');
+    const text = e.clipboardData?.getData('text/plain') ?? '';
     e.preventDefault();
     if (text) editor.type(text);
   });
@@ -138,7 +142,7 @@ export function bindInput(editor, view) {
     const pos = view.posFromPoint(e.clientX, e.clientY);
     if (pos) editor.moveHead(pos, true);
   });
-  const stop = (e) => {
+  const stop = (e: PointerEvent): void => {
     if (!dragging) return;
     dragging = false;
     if (pagesEl.hasPointerCapture(e.pointerId)) pagesEl.releasePointerCapture(e.pointerId);

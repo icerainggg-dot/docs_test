@@ -1,17 +1,100 @@
 // 편집기 핵심: 선택 영역, 편집 명령, 한글 조합, 원격 변경 반영.
-// 화면 그리기는 view.js, 키보드·마우스는 input.js 가 맡는다.
+// 화면 그리기는 view.ts, 키보드·마우스는 input.ts 가 맡는다.
 
 import * as Y from 'yjs';
-import { Reconciler, collectChanges } from '../../../src/shared/reconciler.js';
-import { getLists, keyOfList, bodyKey, cellKey, isBodyKey } from '../../../src/shared/model.js';
-import * as ops from '../../../src/shared/ops.js';
+import type { HwpDocument } from '@rhwp/core';
+import { Reconciler, collectChanges } from '../../../src/shared/reconciler.ts';
+import type { Changes } from '../../../src/shared/reconciler.ts';
+import { getLists, keyOfList, bodyKey, cellKey, isBodyKey, paraId, paraText } from '../../../src/shared/model.ts';
+import type { Lists, ParaList } from '../../../src/shared/model.ts';
+import type { HwpAdapter, HitResult, OverlayKey, TextAttrs, ListRef } from '../../../src/shared/hwp-adapter.ts';
+import * as ops from '../../../src/shared/ops.ts';
 
 const { LOCAL } = ops;
 const NONE = 0xffffffff;
 const COMPOSE_DEFER_MAX_MS = 2000;
 
+/** 편집 위치: 어느 리스트의 몇째 문단, 몇째 글자 */
+export interface EdPos {
+  key: string;
+  idx: number;
+  off: number;
+  /** 문단 id (알고 있으면) */
+  id?: string;
+}
+
+export interface Selection {
+  anchor: EdPos;
+  head: EdPos;
+  start: EdPos;
+  end: EdPos;
+  collapsed: boolean;
+}
+
+/** rHWP 쪽 위치 */
+export interface HwpPos {
+  ref: ListRef;
+  idx: number;
+  off: number;
+}
+
+export interface User {
+  name: string;
+  color: string;
+}
+
+export interface Peer {
+  clientId: number;
+  me: boolean;
+  user: User;
+  sel: { head: EdPos; start: EdPos; end: EdPos } | null;
+}
+
+/** 다른 참여자에게 알리는 내 상태 */
+interface AwarenessState {
+  user?: User;
+  sel?: { a: unknown; h: unknown };
+}
+
+/** y-protocols Awareness 중 편집기가 쓰는 부분 */
+export interface AwarenessLike {
+  clientID: number;
+  getStates(): Map<number, Record<string, unknown>>;
+  setLocalStateField(field: string, value: unknown): void;
+  on(event: 'change', fn: () => void): void;
+  off(event: 'change', fn: () => void): void;
+}
+
+export type EditorEvent = 'doc' | 'selection' | 'awareness';
+
+interface Composition {
+  start: Y.RelativePosition;
+  len: number;
+  attrs: TextAttrs;
+}
+
 export class Editor {
-  constructor({ hwp, ydoc, awareness, user }) {
+  readonly hwp: HwpDocument;
+  readonly ydoc: Y.Doc;
+  readonly awareness: AwarenessLike;
+  readonly lists: Lists;
+  readonly rec: Reconciler;
+  readonly adapter: HwpAdapter;
+  readonly undoManager: Y.UndoManager;
+  /** rHWP 문서가 바뀔 때마다 올라간다 (쪽 다시 그리기 판단용) */
+  rev = 0;
+
+  private sel: { anchor: Y.RelativePosition; head: Y.RelativePosition } | null = null;
+  private lastHead: EdPos | null = null;
+  private preferredX = -1;
+  private composition: Composition | null = null;
+  private pendingRemote: Changes = new Map();
+  private deferTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly listeners = new Set<(type: EditorEvent) => void>();
+  private readonly onDeep: (events: Y.YEvent<Y.AbstractType<unknown>>[], tr: Y.Transaction) => void;
+  private readonly onAwareness: () => void;
+
+  constructor({ hwp, ydoc, awareness, user }: { hwp: HwpDocument; ydoc: Y.Doc; awareness: AwarenessLike; user: User }) {
     this.hwp = hwp;
     this.ydoc = ydoc;
     this.awareness = awareness;
@@ -21,13 +104,6 @@ export class Editor {
     this.adapter = this.rec.adapter;
 
     this.undoManager = new Y.UndoManager(this.lists, { trackedOrigins: new Set([LOCAL]), captureTimeout: 600 });
-    this.sel = null; // { anchor: RelativePosition, head: RelativePosition }
-    this.preferredX = -1;
-    this.composition = null; // { start: RelativePosition, len, attrs }
-    this.pendingRemote = new Map();
-    this.deferTimer = null;
-    this.listeners = new Set();
-    this.rev = 0; // rHWP 문서가 바뀔 때마다 올라간다
 
     this.onDeep = (events, tr) => this.handleChanges(events, tr);
     this.lists.observeDeep(this.onDeep);
@@ -38,32 +114,32 @@ export class Editor {
     this.setCaret(this.firstPos());
   }
 
-  destroy() {
+  destroy(): void {
     this.lists.unobserveDeep(this.onDeep);
     this.awareness.off('change', this.onAwareness);
     this.undoManager.destroy();
-    clearTimeout(this.deferTimer);
+    if (this.deferTimer) clearTimeout(this.deferTimer);
   }
 
-  on(fn) {
+  on(fn: (type: EditorEvent) => void): () => void {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
   }
 
-  emit(type) {
+  private emit(type: EditorEvent): void {
     for (const fn of this.listeners) fn(type);
   }
 
   // ── Y 변경 → rHWP ──────────────────────────────────────────
 
-  handleChanges(events, tr) {
+  private handleChanges(events: Y.YEvent<Y.AbstractType<unknown>>[], tr: Y.Transaction): void {
     if (tr.local) {
       // 내 편집(실행 취소 포함)은 바로 반영한다. 같은 리스트에 미뤄 둔 원격 변경도 함께.
       const changes = collectChanges(events);
       for (const [key, ids] of changes) {
         if (!this.pendingRemote.has(key)) continue;
         const pend = this.pendingRemote.get(key);
-        if (ids === null || pend === null) changes.set(key, null);
+        if (ids === null || !pend) changes.set(key, null);
         else for (const id of pend) ids.add(id);
         this.pendingRemote.delete(key);
       }
@@ -79,8 +155,8 @@ export class Editor {
     this.flushRemote();
   }
 
-  flushRemote() {
-    clearTimeout(this.deferTimer);
+  private flushRemote(): void {
+    if (this.deferTimer) clearTimeout(this.deferTimer);
     this.deferTimer = null;
     if (!this.pendingRemote.size) return;
     const changes = this.pendingRemote;
@@ -88,7 +164,7 @@ export class Editor {
     this.apply(changes);
   }
 
-  apply(changes) {
+  private apply(changes: Changes): void {
     try {
       if (this.rec.sync(changes)) this.rev++;
     } catch (e) {
@@ -99,51 +175,58 @@ export class Editor {
 
   // ── 위치 ───────────────────────────────────────────────────
 
-  firstPos() {
+  firstPos(): EdPos {
     return { key: bodyKey(0), idx: 0, off: 0 };
   }
 
-  list(key) {
-    return this.lists.get(key);
+  list(key: string): ParaList {
+    const l = this.lists.get(key);
+    if (!l) throw new Error(`문단 리스트 ${key} 이(가) 없습니다.`);
+    return l;
   }
 
-  textLen(key, idx) {
-    return this.list(key).get(idx).get('t').length;
+  private text(key: string, idx: number): Y.Text {
+    const p = this.list(key).get(idx);
+    if (!p) throw new RangeError(`문단 ${key}#${idx} 이(가) 없습니다.`);
+    return paraText(p);
   }
 
-  toRel(pos, assoc = 0) {
-    const t = this.list(pos.key).get(pos.idx).get('t');
+  textLen(key: string, idx: number): number {
+    return this.text(key, idx).length;
+  }
+
+  private toRel(pos: EdPos, assoc = 0): Y.RelativePosition {
+    const t = this.text(pos.key, pos.idx);
     return Y.createRelativePositionFromTypeIndex(t, Math.min(pos.off, t.length), assoc);
   }
 
-  fromRel(rel) {
+  fromRel(rel: Y.RelativePosition | null | undefined): EdPos | null {
     if (!rel) return null;
     const abs = Y.createAbsolutePositionFromRelativePosition(rel, this.ydoc);
     if (!abs) return null;
     const text = abs.type;
     const para = text.parent;
     const list = para?.parent;
-    if (!list || text._item?.deleted || para._item?.deleted || list._item?.deleted) return null;
+    if (!para || !list || text._item?.deleted || para._item?.deleted || list._item?.deleted) return null;
     const key = keyOfList(list);
     if (!key || this.lists.get(key) !== list) return null;
     let idx = 0;
-    for (const p of list) {
-      if (p === para) return { key, idx, off: abs.index, id: para.get('id') };
+    for (const p of this.list(key)) {
+      if (p === para) return { key, idx, off: abs.index, id: paraId(p) };
       idx++;
     }
     return null;
   }
 
   /** 현재 선택 영역. 가리키던 문단이 없어졌으면 가까운 곳으로 옮긴다. */
-  selection() {
+  selection(): Selection {
     let head = this.fromRel(this.sel?.head);
     let anchor = this.fromRel(this.sel?.anchor);
     if (!head) {
       const last = this.lastHead;
       if (last && this.lists.has(last.key)) {
-        const list = this.list(last.key);
-        const idx = Math.min(last.idx, list.length - 1);
-        head = { key: last.key, idx, off: Math.min(last.off, list.get(idx).get('t').length) };
+        const idx = Math.min(last.idx, this.list(last.key).length - 1);
+        head = { key: last.key, idx, off: Math.min(last.off, this.textLen(last.key, idx)) };
       } else {
         head = this.firstPos();
       }
@@ -157,7 +240,7 @@ export class Editor {
     return { anchor, head, start, end, collapsed: anchor.idx === head.idx && anchor.off === head.off };
   }
 
-  setSelection(anchor, head, { keepX = false } = {}) {
+  setSelection(anchor: EdPos, head: EdPos, { keepX = false }: { keepX?: boolean } = {}): void {
     if (anchor.key !== head.key) anchor = head;
     this.sel = { anchor: this.toRel(anchor), head: this.toRel(head) };
     this.lastHead = head;
@@ -166,11 +249,11 @@ export class Editor {
     this.emit('selection');
   }
 
-  setCaret(pos, opts) {
+  setCaret(pos: EdPos, opts?: { keepX?: boolean }): void {
     this.setSelection(pos, pos, opts);
   }
 
-  moveHead(pos, extend, opts) {
+  moveHead(pos: EdPos, extend: boolean, opts?: { keepX?: boolean }): void {
     if (extend) {
       const { anchor } = this.selection();
       if (anchor.key !== pos.key) return; // 선택은 한 리스트(본문 또는 한 셀) 안에서만
@@ -180,7 +263,8 @@ export class Editor {
     }
   }
 
-  publishSelection() {
+  private publishSelection(): void {
+    if (!this.sel) return;
     this.awareness.setLocalStateField('sel', {
       a: Y.relativePositionToJSON(this.sel.anchor),
       h: Y.relativePositionToJSON(this.sel.head),
@@ -188,26 +272,29 @@ export class Editor {
   }
 
   /** rHWP 쪽 위치(리스트 참조 + 문단 번호). 아직 반영되지 않은 문단이면 null. */
-  hwpPos(pos) {
+  hwpPos(pos: EdPos): HwpPos | null {
     const ref = this.rec.ref(pos.key);
     if (!ref) return null;
-    const id = pos.id ?? this.list(pos.key).get(pos.idx)?.get('id');
+    const p = this.lists.get(pos.key)?.get(pos.idx);
+    const id = pos.id ?? (p ? paraId(p) : undefined);
+    if (id === undefined) return null;
     const idx = this.rec.indexOf(pos.key, id);
     if (idx < 0) return null;
     return { ref, idx, off: Math.min(pos.off, this.adapter.paraLen(ref, idx)) };
   }
 
   /** hitTest·moveVertical 결과 → 편집 위치 */
-  posFromHit(h) {
+  posFromHit(h: HitResult | null): EdPos | null {
     if (!h || h.sectionIndex === undefined) return null;
-    let key;
-    let idx;
+    let key: string;
+    let idx: number;
     const inCell = h.parentParaIndex !== undefined && h.parentParaIndex !== null && h.parentParaIndex !== NONE;
     if (inCell) {
       if (h.cellPath && h.cellPath.length > 1) return null; // 표 안의 표는 아직 편집하지 않는다
-      const ownerId = this.rec.ids(bodyKey(h.sectionIndex))[h.parentParaIndex];
+      const ownerId = this.rec.ids(bodyKey(h.sectionIndex))[h.parentParaIndex!];
+      if (ownerId === undefined || h.controlIndex === undefined || h.cellIndex === undefined) return null;
       key = cellKey(ownerId, h.controlIndex, h.cellIndex);
-      idx = h.cellParaIndex;
+      idx = h.cellParaIndex ?? 0;
     } else {
       key = bodyKey(h.sectionIndex);
       idx = h.paragraphIndex;
@@ -217,15 +304,15 @@ export class Editor {
     if (!list || id === undefined) return null;
     let yIdx = 0;
     for (const p of list) {
-      if (p.get('id') === id) {
-        return { key, idx: yIdx, off: Math.min(h.charOffset ?? 0, p.get('t').length), id };
+      if (paraId(p) === id) {
+        return { key, idx: yIdx, off: Math.min(h.charOffset ?? 0, paraText(p).length), id };
       }
       yIdx++;
     }
     return null;
   }
 
-  canRemove(key, idx) {
+  canRemove(key: string, idx: number): boolean {
     if (!isBodyKey(key)) return true;
     const hp = this.hwpPos({ key, idx, off: 0 });
     if (!hp) return false;
@@ -234,20 +321,20 @@ export class Editor {
 
   // ── 편집 명령 ───────────────────────────────────────────────
 
-  transact(fn) {
-    let result;
+  private transact<T>(fn: () => T): T {
+    let result!: T;
     this.ydoc.transact(() => {
       result = fn();
     }, LOCAL);
     return result;
   }
 
-  deleteSelectionIn(s) {
+  private deleteSelectionIn(s: Selection): ops.Pos {
     const list = this.list(s.start.key);
     return ops.deleteRange(list, s.start.idx, s.start.off, s.end.idx, s.end.off, (i) => this.canRemove(s.start.key, i));
   }
 
-  type(text) {
+  type(text: string): void {
     if (!text) return;
     const s = this.selection();
     const key = s.start.key;
@@ -259,7 +346,7 @@ export class Editor {
     this.setCaret({ key, ...p });
   }
 
-  enter() {
+  enter(): void {
     const s = this.selection();
     const key = s.start.key;
     const list = this.list(key);
@@ -270,7 +357,7 @@ export class Editor {
     this.setCaret({ key, ...p });
   }
 
-  deleteSelection() {
+  deleteSelection(): boolean {
     const s = this.selection();
     if (s.collapsed) return false;
     const p = this.transact(() => this.deleteSelectionIn(s));
@@ -278,12 +365,12 @@ export class Editor {
     return true;
   }
 
-  backspace() {
+  backspace(): void {
     if (this.deleteSelection()) return;
     const { head } = this.selection();
     const list = this.list(head.key);
     if (head.off > 0) {
-      const str = list.get(head.idx).get('t').toString();
+      const str = this.text(head.key, head.idx).toString();
       const c = str.charCodeAt(head.off - 1);
       const n = head.off > 1 && c >= 0xdc00 && c <= 0xdfff ? 2 : 1;
       this.transact(() => ops.deleteRange(list, head.idx, head.off - n, head.idx, head.off));
@@ -294,11 +381,11 @@ export class Editor {
     }
   }
 
-  del() {
+  del(): void {
     if (this.deleteSelection()) return;
     const { head } = this.selection();
     const list = this.list(head.key);
-    const str = list.get(head.idx).get('t').toString();
+    const str = this.text(head.key, head.idx).toString();
     if (head.off < str.length) {
       const c = str.charCodeAt(head.off);
       const n = c >= 0xd800 && c <= 0xdbff && head.off + 1 < str.length ? 2 : 1;
@@ -311,7 +398,7 @@ export class Editor {
   }
 
   /** 덧입힌 서식 켬/끔. 예: toggleFormat('b') */
-  toggleFormat(attr) {
+  toggleFormat(attr: Exclude<OverlayKey, 'col'>): boolean {
     const s = this.selection();
     if (s.collapsed) return false;
     const list = this.list(s.start.key);
@@ -323,7 +410,7 @@ export class Editor {
     return true;
   }
 
-  setColor(color) {
+  setColor(color: string): boolean {
     const s = this.selection();
     if (s.collapsed) return false;
     const list = this.list(s.start.key);
@@ -334,45 +421,43 @@ export class Editor {
   }
 
   /** 선택 영역의 서식 상태 (도구 모음 표시용) */
-  formatState() {
+  formatState(): Record<'b' | 'i' | 'u' | 's', boolean> {
     const s = this.selection();
     const list = this.list(s.start.key);
-    const out = {};
-    for (const attr of ['b', 'i', 'u', 's']) {
-      out[attr] = s.collapsed
-        ? ops.attrsAt(list.get(s.head.idx), s.head.off)[attr] === true
-        : ops.rangeHasAttr(list, s.start.idx, s.start.off, s.end.idx, s.end.off, attr, true);
-    }
-    return out;
+    const at = (attr: 'b' | 'i' | 'u' | 's'): boolean => {
+      if (!s.collapsed) return ops.rangeHasAttr(list, s.start.idx, s.start.off, s.end.idx, s.end.off, attr, true);
+      const p = list.get(s.head.idx);
+      return p ? ops.attrsAt(p, s.head.off)[attr] === true : false;
+    };
+    return { b: at('b'), i: at('i'), u: at('u'), s: at('s') };
   }
 
-  undo() {
+  undo(): void {
     this.undoManager.undo();
     this.emit('selection');
   }
 
-  redo() {
+  redo(): void {
     this.undoManager.redo();
     this.emit('selection');
   }
 
-  selectedText() {
+  selectedText(): string {
     const s = this.selection();
     if (s.collapsed) return '';
     return ops.rangeText(this.list(s.start.key), s.start.idx, s.start.off, s.end.idx, s.end.off);
   }
 
-  selectAll() {
+  selectAll(): void {
     const { head } = this.selection();
-    const list = this.list(head.key);
-    const last = list.length - 1;
+    const last = this.list(head.key).length - 1;
     this.setSelection({ key: head.key, idx: 0, off: 0 }, { key: head.key, idx: last, off: this.textLen(head.key, last) });
   }
 
-  selectWord() {
+  selectWord(): void {
     const { head } = this.selection();
-    const str = this.list(head.key).get(head.idx).get('t').toString();
-    const isWord = (ch) => ch !== undefined && !/\s/.test(ch);
+    const str = this.text(head.key, head.idx).toString();
+    const isWord = (ch: string | undefined): boolean => ch !== undefined && !/\s/.test(ch);
     let a = head.off;
     let b = head.off;
     while (a > 0 && isWord(str[a - 1])) a--;
@@ -383,34 +468,34 @@ export class Editor {
 
   // ── 한글(IME) 조합 ──────────────────────────────────────────
 
-  beginComposition() {
+  beginComposition(): void {
     this.deleteSelection();
     const { head } = this.selection();
+    const p = this.list(head.key).get(head.idx);
     this.composition = {
       start: this.toRel(head, -1),
       len: 0,
-      attrs: ops.attrsAt(this.list(head.key).get(head.idx), head.off),
+      attrs: p ? ops.attrsAt(p, head.off) : {},
     };
   }
 
-  updateComposition(text) {
+  updateComposition(text: string): void {
     const c = this.composition;
     if (!c) return;
     const p = this.fromRel(c.start);
     if (!p) return;
-    const list = this.list(p.key);
-    text = text.replace(/[\u0000-\u001f]/g, '');
+    const clean = text.replace(/[\u0000-\u001f]/g, '');
     this.transact(() => {
-      const t = list.get(p.idx).get('t');
+      const t = this.text(p.key, p.idx);
       const del = Math.min(c.len, t.length - p.off);
       if (del > 0) t.delete(p.off, del);
-      if (text) t.insert(p.off, text, { ...c.attrs });
+      if (clean) t.insert(p.off, clean, { ...c.attrs });
     });
-    c.len = text.length;
-    this.setCaret({ key: p.key, idx: p.idx, off: p.off + text.length });
+    c.len = clean.length;
+    this.setCaret({ key: p.key, idx: p.idx, off: p.off + clean.length });
   }
 
-  endComposition(text) {
+  endComposition(text?: string): void {
     if (!this.composition) return;
     this.updateComposition(text ?? '');
     this.composition = null;
@@ -420,7 +505,7 @@ export class Editor {
   }
 
   /** 조합 중인 글자의 범위 (밑줄 표시용) */
-  compositionRange() {
+  compositionRange(): { key: string; idx: number; id?: string; from: number; to: number } | null {
     const c = this.composition;
     if (!c || !c.len) return null;
     const p = this.fromRel(c.start);
@@ -429,7 +514,7 @@ export class Editor {
 
   // ── 커서 이동 ───────────────────────────────────────────────
 
-  moveChar(dir, extend) {
+  moveChar(dir: -1 | 1, extend: boolean): void {
     const s = this.selection();
     if (!extend && !s.collapsed) return this.setCaret(dir < 0 ? s.start : s.end);
     const { head } = s;
@@ -447,11 +532,11 @@ export class Editor {
     this.moveHead({ key: head.key, idx, off }, extend);
   }
 
-  moveLine(delta, extend) {
+  moveLine(delta: -1 | 1, extend: boolean): void {
     const { head } = this.selection();
     const hp = this.hwpPos(head);
     if (!hp) return;
-    let r;
+    let r: HitResult;
     try {
       r = this.adapter.moveVertical(hp.ref, hp.idx, hp.off, delta, this.preferredX);
     } catch {
@@ -464,7 +549,7 @@ export class Editor {
     this.preferredX = x;
   }
 
-  moveLineEdge(toEnd, extend) {
+  moveLineEdge(toEnd: boolean, extend: boolean): void {
     const { head } = this.selection();
     const hp = this.hwpPos(head);
     if (!hp) return;
@@ -480,22 +565,22 @@ export class Editor {
     this.moveHead({ key: head.key, idx: head.idx, off }, extend);
   }
 
-  moveDocEdge(toEnd, extend) {
+  moveDocEdge(toEnd: boolean, extend: boolean): void {
     const { head } = this.selection();
     const key = extend ? head.key : bodyKey(toEnd ? this.adapter.sectionCount() - 1 : 0);
-    const list = this.list(key);
-    const idx = toEnd ? list.length - 1 : 0;
+    const idx = toEnd ? this.list(key).length - 1 : 0;
     this.moveHead({ key, idx, off: toEnd ? this.textLen(key, idx) : 0 }, extend);
   }
 
   // ── 다른 참여자 ─────────────────────────────────────────────
 
-  peers() {
-    const out = [];
-    for (const [clientId, state] of this.awareness.getStates()) {
+  peers(): Peer[] {
+    const out: Peer[] = [];
+    for (const [clientId, raw] of this.awareness.getStates()) {
+      const state = raw as AwarenessState;
       if (!state?.user) continue;
       const me = clientId === this.awareness.clientID;
-      let sel = null;
+      let sel: Peer['sel'] = null;
       if (!me && state.sel) {
         try {
           const head = this.fromRel(Y.createRelativePositionFromJSON(state.sel.h));

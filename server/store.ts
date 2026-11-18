@@ -12,49 +12,78 @@ import path from 'node:path';
 const ID_RE = /^[a-z0-9]{12}$/;
 const VERSION_RE = /^\d{8}T\d{6}Z\.hwpx$/;
 
+/** 마지막 저장 결과 */
+export interface SaveStatus {
+  at: string;
+  ok: boolean;
+  /** 저장 검사에서 나온 불일치 수 */
+  diffs: number;
+  error?: string;
+  /** WebDAV 에 올린 주소, 또는 실패 메시지 */
+  webdav: string | null;
+}
+
+export interface DocMeta {
+  id: string;
+  title: string;
+  filename: string;
+  createdAt: string;
+  updatedAt: string;
+  save: SaveStatus | null;
+}
+
+export interface StoreOptions {
+  maxVersions?: number;
+  versionIntervalMs?: number;
+}
+
 export class Store {
-  constructor(dataDir, { maxVersions = 30, versionIntervalMs = 5 * 60 * 1000 } = {}) {
+  readonly root: string;
+  readonly maxVersions: number;
+  readonly versionIntervalMs: number;
+
+  constructor(dataDir: string, { maxVersions = 30, versionIntervalMs = 5 * 60 * 1000 }: StoreOptions = {}) {
     this.root = path.join(dataDir, 'docs');
     this.maxVersions = maxVersions;
     this.versionIntervalMs = versionIntervalMs;
   }
 
-  static isId(id) {
+  static isId(id: unknown): id is string {
     return typeof id === 'string' && ID_RE.test(id);
   }
 
-  dir(id) {
+  dir(id: string): string {
     if (!Store.isId(id)) throw new Error('잘못된 문서 id');
     return path.join(this.root, id);
   }
 
-  async write(file, data) {
+  private async write(file: string, data: Uint8Array | string): Promise<void> {
     const tmp = `${file}.${randomBytes(4).toString('hex')}.tmp`;
     await writeFile(tmp, data);
     await rename(tmp, file);
   }
 
-  async create({ title, filename, base, ydocUpdate }) {
+  async create(input: { title: string; filename: string; base: Uint8Array; ydocUpdate: Uint8Array }): Promise<DocMeta> {
     const id = randomBytes(9).toString('base64url').toLowerCase().replace(/[^a-z0-9]/g, 'x').slice(0, 12);
     const dir = this.dir(id);
     await mkdir(path.join(dir, 'versions'), { recursive: true });
     const now = new Date().toISOString();
-    const meta = { id, title, filename, createdAt: now, updatedAt: now, save: null };
-    await this.write(path.join(dir, 'base.bin'), base);
-    await this.write(path.join(dir, 'ydoc.bin'), ydocUpdate);
+    const meta: DocMeta = { id, title: input.title, filename: input.filename, createdAt: now, updatedAt: now, save: null };
+    await this.write(path.join(dir, 'base.bin'), input.base);
+    await this.write(path.join(dir, 'ydoc.bin'), input.ydocUpdate);
     await this.write(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 2));
     return meta;
   }
 
-  async meta(id) {
+  async meta(id: string): Promise<DocMeta | null> {
     try {
-      return JSON.parse(await readFile(path.join(this.dir(id), 'meta.json'), 'utf8'));
+      return JSON.parse(await readFile(path.join(this.dir(id), 'meta.json'), 'utf8')) as DocMeta;
     } catch {
       return null;
     }
   }
 
-  async updateMeta(id, patch) {
+  async updateMeta(id: string, patch: Partial<Omit<DocMeta, 'id'>>): Promise<DocMeta | null> {
     const meta = await this.meta(id);
     if (!meta) return null;
     Object.assign(meta, patch);
@@ -62,18 +91,18 @@ export class Store {
     return meta;
   }
 
-  async list() {
-    let names = [];
+  async list(): Promise<DocMeta[]> {
+    let names: string[] = [];
     try {
       names = await readdir(this.root);
     } catch {
       return [];
     }
-    const metas = await Promise.all(names.filter(Store.isId).map((id) => this.meta(id)));
-    return metas.filter(Boolean).sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+    const metas = await Promise.all(names.filter((n) => Store.isId(n)).map((id) => this.meta(id)));
+    return metas.filter((m): m is DocMeta => m !== null).sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
   }
 
-  async read(id, name) {
+  private async read(id: string, name: string): Promise<Uint8Array | null> {
     try {
       return new Uint8Array(await readFile(path.join(this.dir(id), name)));
     } catch {
@@ -81,24 +110,24 @@ export class Store {
     }
   }
 
-  base(id) {
+  base(id: string): Promise<Uint8Array | null> {
     return this.read(id, 'base.bin');
   }
 
-  ydoc(id) {
+  ydoc(id: string): Promise<Uint8Array | null> {
     return this.read(id, 'ydoc.bin');
   }
 
-  latest(id) {
+  latest(id: string): Promise<Uint8Array | null> {
     return this.read(id, 'latest.hwpx');
   }
 
-  async saveYdoc(id, update) {
+  async saveYdoc(id: string, update: Uint8Array): Promise<void> {
     await this.write(path.join(this.dir(id), 'ydoc.bin'), update);
   }
 
   /** 저장본을 기록한다. 일정 간격마다 시점별 저장본도 남긴다. */
-  async saveHwpx(id, bytes) {
+  async saveHwpx(id: string, bytes: Uint8Array): Promise<void> {
     const dir = this.dir(id);
     await this.write(path.join(dir, 'latest.hwpx'), bytes);
     const vdir = path.join(dir, 'versions');
@@ -116,7 +145,7 @@ export class Store {
     }
   }
 
-  async versions(id) {
+  async versions(id: string): Promise<string[]> {
     try {
       const names = await readdir(path.join(this.dir(id), 'versions'));
       return names.filter((n) => VERSION_RE.test(n)).sort().reverse();
@@ -125,12 +154,12 @@ export class Store {
     }
   }
 
-  version(id, name) {
-    if (!VERSION_RE.test(name)) return null;
+  version(id: string, name: string): Promise<Uint8Array | null> {
+    if (!VERSION_RE.test(name)) return Promise.resolve(null);
     return this.read(id, path.join('versions', name));
   }
 
-  async remove(id) {
+  async remove(id: string): Promise<void> {
     await rm(this.dir(id), { recursive: true, force: true });
   }
 }

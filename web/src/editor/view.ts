@@ -1,21 +1,44 @@
 // 화면: 쪽 그리기(rHWP → canvas), 커서·선택 영역·다른 참여자 표시.
 
+import type { Editor, EdPos } from './editor.ts';
+import type { CursorRect } from '../../../src/shared/hwp-adapter.ts';
+
 const PAGE_GAP_MARGIN = 600; // 화면 밖 이만큼까지 미리 그린다
 
+interface PageEl {
+  el: HTMLDivElement;
+  canvas: HTMLCanvasElement;
+  overlay: HTMLDivElement;
+  /** 마지막으로 그린 문서 판 (editor.rev) */
+  rev: number;
+  w: number;
+  h: number;
+  zoom: number;
+}
+
 export class View {
-  constructor(editor, scroller) {
+  readonly editor: Editor;
+  readonly scroller: HTMLElement;
+  readonly pagesEl: HTMLDivElement;
+  /** 글자 입력을 받는 숨은 입력란. 커서 자리에 두어 한글 입력기 창이 그 근처에 뜨게 한다. */
+  readonly input: HTMLTextAreaElement;
+  zoom = 1;
+
+  private pages: PageEl[] = [];
+  private frame = 0;
+  private followCaret = false;
+  private caretEl: HTMLDivElement | null = null;
+  private readonly off: () => void;
+  private readonly onScroll = (): void => this.schedule();
+
+  constructor(editor: Editor, scroller: HTMLElement) {
     this.editor = editor;
     this.scroller = scroller;
-    this.zoom = 1;
-    this.pages = [];
-    this.frame = 0;
-    this.followCaret = false;
 
     this.pagesEl = document.createElement('div');
     this.pagesEl.className = 'pages';
     scroller.append(this.pagesEl);
 
-    // 글자 입력을 받는 숨은 입력란. 커서 자리에 두어 한글 입력기 창이 그 근처에 뜨게 한다.
     this.input = document.createElement('textarea');
     this.input.className = 'ime-input';
     this.input.setAttribute('autocapitalize', 'off');
@@ -29,13 +52,12 @@ export class View {
       if (type === 'selection') this.followCaret = true;
       this.schedule();
     });
-    this.onScroll = () => this.schedule();
     scroller.addEventListener('scroll', this.onScroll, { passive: true });
     window.addEventListener('resize', this.onScroll);
     this.schedule();
   }
 
-  destroy() {
+  destroy(): void {
     this.off();
     cancelAnimationFrame(this.frame);
     this.scroller.removeEventListener('scroll', this.onScroll);
@@ -44,13 +66,13 @@ export class View {
     this.input.remove();
   }
 
-  setZoom(zoom) {
+  setZoom(zoom: number): void {
     this.zoom = Math.min(3, Math.max(0.4, zoom));
     for (const p of this.pages) p.rev = -1;
     this.schedule();
   }
 
-  schedule() {
+  schedule(): void {
     if (this.frame) return;
     this.frame = requestAnimationFrame(() => {
       this.frame = 0;
@@ -58,7 +80,7 @@ export class View {
     });
   }
 
-  update() {
+  private update(): void {
     this.layout();
     this.renderVisible();
     this.drawOverlays();
@@ -68,7 +90,7 @@ export class View {
     }
   }
 
-  layout() {
+  private layout(): void {
     const a = this.editor.adapter;
     let count = 1;
     try {
@@ -76,7 +98,7 @@ export class View {
     } catch {
       /* 그대로 */
     }
-    while (this.pages.length > count) this.pages.pop().el.remove();
+    while (this.pages.length > count) this.pages.pop()?.el.remove();
     for (let i = 0; i < count; i++) {
       let page = this.pages[i];
       if (!page) {
@@ -88,7 +110,7 @@ export class View {
         overlay.className = 'overlay';
         el.append(canvas, overlay);
         this.pagesEl.append(el);
-        page = this.pages[i] = { el, canvas, overlay, rev: -1, w: 0, h: 0 };
+        page = this.pages[i] = { el, canvas, overlay, rev: -1, w: 0, h: 0, zoom: 0 };
       }
       let info;
       try {
@@ -107,7 +129,7 @@ export class View {
     }
   }
 
-  renderVisible() {
+  private renderVisible(): void {
     const view = this.scroller.getBoundingClientRect();
     const scale = this.zoom * Math.min(window.devicePixelRatio || 1, 2);
     this.pages.forEach((page, i) => {
@@ -123,7 +145,7 @@ export class View {
     });
   }
 
-  box(pageIndex, cls, x, y, w, h, color) {
+  private box(pageIndex: number, cls: string, x: number, y: number, w: number, h: number, color?: string): HTMLDivElement | null {
     const page = this.pages[pageIndex];
     if (!page) return null;
     const el = document.createElement('div');
@@ -135,12 +157,12 @@ export class View {
     return el;
   }
 
-  drawRange(start, end, cls, color) {
+  private drawRange(start: EdPos, end: EdPos, cls: string, color?: string): void {
     const ed = this.editor;
     const s = ed.hwpPos(start);
     const e = ed.hwpPos(end);
     if (!s || !e) return;
-    let rects = [];
+    let rects;
     try {
       rects = ed.adapter.selectionRects(s.ref, s.idx, s.off, e.idx, e.off);
     } catch {
@@ -149,7 +171,7 @@ export class View {
     for (const r of rects) this.box(r.pageIndex, cls, r.x, r.y, Math.max(r.width, 2), r.height, color);
   }
 
-  caretRect(pos) {
+  private caretRect(pos: EdPos): CursorRect | null {
     const hp = this.editor.hwpPos(pos);
     if (!hp) return null;
     try {
@@ -159,7 +181,7 @@ export class View {
     }
   }
 
-  drawOverlays() {
+  private drawOverlays(): void {
     const ed = this.editor;
     for (const p of this.pages) p.overlay.replaceChildren();
     this.caretEl = null;
@@ -185,9 +207,7 @@ export class View {
     const sel = ed.selection();
     if (!sel.collapsed) this.drawRange(sel.start, sel.end, 'sel');
     const comp = ed.compositionRange();
-    if (comp) {
-      this.drawRange({ ...comp, off: comp.from }, { ...comp, off: comp.to }, 'composing');
-    }
+    if (comp) this.drawRange({ ...comp, off: comp.from }, { ...comp, off: comp.to }, 'composing');
     const r = this.caretRect(sel.head);
     if (r) {
       this.caretEl = this.box(r.pageIndex, 'caret', r.x, r.y, 0, r.height);
@@ -202,7 +222,7 @@ export class View {
     }
   }
 
-  scrollCaretIntoView() {
+  private scrollCaretIntoView(): void {
     if (!this.caretEl) return;
     const c = this.caretEl.getBoundingClientRect();
     const v = this.scroller.getBoundingClientRect();
@@ -214,19 +234,12 @@ export class View {
   }
 
   /** 마우스 위치 → 편집 위치 */
-  posFromPoint(clientX, clientY) {
-    let best = null;
+  posFromPoint(clientX: number, clientY: number): EdPos | null {
+    let best: { i: number; r: DOMRect } | null = null;
     for (let i = 0; i < this.pages.length; i++) {
-      const r = this.pages[i].el.getBoundingClientRect();
-      if (clientY >= r.top && clientY <= r.bottom) {
-        best = { i, r };
-        break;
-      }
-      if (clientY < r.top) {
-        best = { i, r };
-        break;
-      }
+      const r = this.pages[i]!.el.getBoundingClientRect();
       best = { i, r };
+      if (clientY <= r.bottom) break; // 이 쪽 안이거나 이 쪽보다 위
     }
     if (!best) return null;
     const x = Math.min(Math.max(clientX - best.r.left, 0), best.r.width) / this.zoom;
@@ -238,7 +251,7 @@ export class View {
     }
   }
 
-  focus() {
+  focus(): void {
     this.input.focus({ preventScroll: true });
   }
 }

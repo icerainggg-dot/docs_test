@@ -1,0 +1,16 @@
+{
+  // 브라우저 편집기: Vite 가 묶는다.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["es2023", "dom", "dom.iterable"],
+    "types": ["vite/client"],
+    "composite": true,
+    "emitDeclarationOnly": true,
+    "noEmit": false,
+    "declarationDir": "node_modules/.cache/tsc/web",
+    "tsBuildInfoFile": "node_modules/.cache/tsc/web.tsbuildinfo"
+  },
+  "include": ["web/src", "src/shared", "vite.config.ts"]
+}

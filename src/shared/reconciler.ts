@@ -11,10 +11,38 @@
 //   - 글자모양 번호 복원 + 덧입힌 서식 적용
 // 그래서 표·그림 같은 개체는 원래 문단에서 움직이지 않는다.
 
-import { HwpAdapter, bodyRef, cellRef, overlayToProps, OVERLAY_KEYS } from './hwp-adapter.js';
-import { getLists, scanDocument, parseKey, isBodyKey } from './model.js';
+import type * as Y from 'yjs';
+import type { HwpDocument } from '@rhwp/core';
+import { HwpAdapter, bodyRef, cellRef, overlayToProps, OVERLAY_KEYS } from './hwp-adapter.ts';
+import type { ListRef, TextAttrs } from './hwp-adapter.ts';
+import { getLists, scanDocument, parseKey, isBodyKey, paraId, paraText, paraCs, textDelta } from './model.ts';
+import type { DeltaInsert, Lists, Para } from './model.ts';
 
-const fmtKey = (a) => {
+/** listKey → 바뀐 문단 id 들 (null 이면 리스트 전체) */
+export type Changes = Map<string, Set<string> | null>;
+
+/** 서식이 같은 글자 구간. k 는 서식 비교용 열쇠. */
+export interface FmtRun {
+  len: number;
+  k: string;
+}
+
+interface AttrRun extends FmtRun {
+  attrs: TextAttrs;
+}
+
+/** rHWP 문서의 현재 모습: 문단 id 순서와 문단별 서식 구간 */
+interface Mirror {
+  ids: string[];
+  fmt: Map<string, FmtRun[]>;
+}
+
+export type Diff =
+  | { key: string; error: string }
+  | { key: string; paragraphs: [number, number] }
+  | { key: string; para: number; got: string; want: string };
+
+const fmtKey = (a: TextAttrs): string => {
   let k = a.cs === undefined || a.cs === null ? '' : String(a.cs);
   for (const key of OVERLAY_KEYS) {
     const v = a[key];
@@ -23,12 +51,12 @@ const fmtKey = (a) => {
   return k;
 };
 
-/** Y.Text delta → 병합된 서식 구간 [{len, k, attrs}] 과 전체 텍스트 */
-export function deltaToRuns(delta) {
-  const runs = [];
+/** Y.Text delta → 병합된 서식 구간과 전체 텍스트 */
+export function deltaToRuns(delta: DeltaInsert[]): { text: string; runs: AttrRun[] } {
+  const runs: AttrRun[] = [];
   let text = '';
   for (const op of delta) {
-    if (typeof op.insert !== 'string' || !op.insert.length) continue;
+    if (!op.insert.length) continue;
     const attrs = op.attributes || {};
     const k = fmtKey(attrs);
     text += op.insert;
@@ -39,39 +67,47 @@ export function deltaToRuns(delta) {
   return { text, runs };
 }
 
-function commonRunPrefix(a, b) {
+function commonRunPrefix(a: FmtRun[], b: FmtRun[]): number {
   let n = 0;
   for (let i = 0; i < a.length && i < b.length; i++) {
-    if (a[i].k !== b[i].k) break;
-    if (a[i].len !== b[i].len) return n + Math.min(a[i].len, b[i].len);
-    n += a[i].len;
+    const x = a[i]!;
+    const y = b[i]!;
+    if (x.k !== y.k) break;
+    if (x.len !== y.len) return n + Math.min(x.len, y.len);
+    n += x.len;
   }
   return n;
 }
 
-function commonRunSuffix(a, b) {
+function commonRunSuffix(a: FmtRun[], b: FmtRun[]): number {
   let n = 0;
   for (let i = a.length - 1, j = b.length - 1; i >= 0 && j >= 0; i--, j--) {
-    if (a[i].k !== b[j].k) break;
-    if (a[i].len !== b[j].len) return n + Math.min(a[i].len, b[j].len);
-    n += a[i].len;
+    const x = a[i]!;
+    const y = b[j]!;
+    if (x.k !== y.k) break;
+    if (x.len !== y.len) return n + Math.min(x.len, y.len);
+    n += x.len;
   }
   return n;
 }
 
-const isHigh = (c) => c >= 0xd800 && c <= 0xdbff;
-const isLow = (c) => c >= 0xdc00 && c <= 0xdfff;
+const isHigh = (c: number): boolean => c >= 0xd800 && c <= 0xdbff;
+const isLow = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
 
 export class Reconciler {
-  constructor(hwpDoc, ydoc) {
+  readonly adapter: HwpAdapter;
+  readonly ydoc: Y.Doc;
+  readonly lists: Lists;
+  /** listKey → rHWP 문서의 현재 모습 */
+  readonly mirror = new Map<string, Mirror>();
+  readonly warnings: string[] = [];
+
+  constructor(hwpDoc: HwpDocument, ydoc: Y.Doc) {
     this.adapter = new HwpAdapter(hwpDoc);
     this.ydoc = ydoc;
     this.lists = getLists(ydoc);
-    /** listKey → { ids: string[], fmt: Map<paraId, runs> } — rHWP 문서의 현재 모습 */
-    this.mirror = new Map();
-    this.warnings = [];
     for (const l of scanDocument(this.adapter)) {
-      const fmt = new Map();
+      const fmt = new Map<string, FmtRun[]>();
       for (const p of l.paras) {
         fmt.set(p.id, p.runs.filter((r) => r.len > 0).map((r) => ({ len: r.len, k: fmtKey({ cs: r.cs }) })));
       }
@@ -80,47 +116,45 @@ export class Reconciler {
   }
 
   /** listKey → rHWP 위치. 표를 품은 문단이 없어졌으면 null. */
-  ref(key) {
+  ref(key: string): ListRef | null {
     const k = parseKey(key);
     if (k.type === 'body') return bodyRef(k.sec);
     for (const [bk, m] of this.mirror) {
-      if (!isBodyKey(bk)) continue;
+      const b = parseKey(bk);
+      if (b.type !== 'body') continue;
       const idx = m.ids.indexOf(k.ownerId);
-      if (idx >= 0) return cellRef(parseKey(bk).sec, idx, k.ctrl, k.cell);
+      if (idx >= 0) return cellRef(b.sec, idx, k.ctrl, k.cell);
     }
     return null;
   }
 
-  ids(key) {
+  ids(key: string): string[] {
     return this.mirror.get(key)?.ids ?? [];
   }
 
-  indexOf(key, id) {
+  indexOf(key: string, id: string): number {
     return this.ids(key).indexOf(id);
   }
 
   /** 모든 리스트를 Y 상태와 맞춘다 (처음 열 때, 저장 워커). */
-  syncAll() {
-    const changes = new Map();
+  syncAll(): void {
+    const changes: Changes = new Map();
     for (const key of this.lists.keys()) changes.set(key, null);
     this.sync(changes);
   }
 
-  /**
-   * @param {Map<string, Set<string>|null>} changes  listKey → 바뀐 문단 id (null 이면 전부)
-   * @returns {boolean} rHWP 문서가 바뀌었는지
-   */
-  sync(changes) {
+  /** @returns rHWP 문서가 바뀌었는지 */
+  sync(changes: Changes): boolean {
     let touched = false;
     // 셀의 위치는 본문 문단 번호에 달려 있으므로 본문을 먼저 맞춘다.
     const keys = [...changes.keys()].sort((a, b) => Number(isBodyKey(b)) - Number(isBodyKey(a)));
     for (const key of keys) {
-      if (this.syncList(key, changes.get(key))) touched = true;
+      if (this.syncList(key, changes.get(key) ?? null)) touched = true;
     }
     return touched;
   }
 
-  syncList(key, changedIds) {
+  private syncList(key: string, changedIds: Set<string> | null): boolean {
     const arr = this.lists.get(key);
     const m = this.mirror.get(key);
     if (!arr || !m) return false;
@@ -130,29 +164,31 @@ export class Reconciler {
     let touched = false;
 
     const paras = arr.toArray();
-    const target = paras.map((p) => p.get('id'));
+    const target = paras.map(paraId);
     const targetSet = new Set(target);
-    const fresh = new Set();
+    const fresh = new Set<string>();
 
     // 1) 없어진 문단 지우기 (뒤에서부터)
     for (let i = m.ids.length - 1; i >= 0; i--) {
-      if (targetSet.has(m.ids[i])) continue;
+      const id = m.ids[i]!;
+      if (targetSet.has(id)) continue;
       if (i === 0) {
         // 리스트의 첫 문단은 편집 규칙상 지워지지 않는다. 방어적으로 비우기만 한다.
         this.warnings.push(`첫 문단 삭제 요청 무시: ${key}`);
         continue;
       }
       a.removePara(ref, i);
-      m.fmt.delete(m.ids[i]);
+      m.fmt.delete(id);
       m.ids.splice(i, 1);
       touched = true;
     }
 
-    // 2) 새 문단 만들기 — 앞 문단의 끝에서 갈라 빈 문단을 얻는다.
+    // 2) 새 문단 만들기
     const known = new Set(m.ids);
     for (let j = 0; j < target.length; j++) {
-      if (m.ids[j] === target[j]) continue;
-      if (known.has(target[j])) {
+      const id = target[j]!;
+      if (m.ids[j] === id) continue;
+      if (known.has(id)) {
         // 순서 바뀜은 모델에 없는 연산이다.
         this.warnings.push(`문단 순서 불일치: ${key}`);
         break;
@@ -163,28 +199,28 @@ export class Reconciler {
         break;
       }
       a.insertParaAfter(ref, j - 1);
-      m.ids.splice(j, 0, target[j]);
-      m.fmt.set(target[j], []);
-      known.add(target[j]);
-      fresh.add(target[j]);
+      m.ids.splice(j, 0, id);
+      m.fmt.set(id, []);
+      known.add(id);
+      fresh.add(id);
       touched = true;
     }
 
     // 3) 문단 내용 맞추기
     for (let idx = 0; idx < target.length; idx++) {
-      const id = target[idx];
+      const id = target[idx]!;
       if (m.ids[idx] !== id) break; // 구조가 어긋났으면 더 진행하지 않는다.
       if (changedIds && !changedIds.has(id) && !fresh.has(id)) continue;
-      if (this.syncPara(ref, idx, id, paras[idx], m)) touched = true;
+      if (this.syncPara(ref, idx, id, paras[idx]!, m)) touched = true;
     }
     return touched;
   }
 
-  syncPara(ref, idx, id, para, m) {
+  private syncPara(ref: ListRef, idx: number, id: string, para: Para, m: Mirror): boolean {
     const a = this.adapter;
-    const { text: next, runs } = deltaToRuns(para.get('t').toDelta());
+    const { text: next, runs } = deltaToRuns(textDelta(paraText(para)));
     const cur = a.text(ref, idx);
-    const baseCs = para.get('cs');
+    const baseCs = paraCs(para);
     let touched = false;
 
     // 글자: 공통 머리/꼬리를 뺀 가운데만 바꾼다.
@@ -231,13 +267,13 @@ export class Reconciler {
   }
 
   /** rHWP 문서의 글자가 Y 상태와 같은지 확인한다. 다른 곳의 목록을 돌려준다. */
-  verify() {
-    const diffs = [];
+  verify(): Diff[] {
+    const diffs: Diff[] = [];
     for (const [key, arr] of this.lists) {
       const ref = this.ref(key);
       if (!ref || !this.mirror.has(key)) continue;
-      const want = arr.map((p) => p.get('t').toString());
-      let n;
+      const want = arr.map((p) => paraText(p).toString());
+      let n: number;
       try {
         n = this.adapter.paraCount(ref);
       } catch (e) {
@@ -248,10 +284,10 @@ export class Reconciler {
         diffs.push({ key, paragraphs: [n, want.length] });
         continue;
       }
-      for (let i = 0; i < n; i++) {
+      want.forEach((w, i) => {
         const got = this.adapter.text(ref, i);
-        if (got !== want[i]) diffs.push({ key, para: i, got, want: want[i] });
-      }
+        if (got !== w) diffs.push({ key, para: i, got, want: w });
+      });
     }
     return diffs;
   }
@@ -261,32 +297,34 @@ export class Reconciler {
  * Y 문서의 변경을 모아 Reconciler 에 넘길 형태로 만든다.
  * observeDeep 이벤트 → Map<listKey, Set<paraId>>
  */
-export function collectChanges(events, into = new Map()) {
-  const lists = events[0]?.transaction.doc.getMap('lists');
+export function collectChanges(events: Y.YEvent<Y.AbstractType<unknown>>[], into: Changes = new Map()): Changes {
+  const first = events[0];
+  if (!first) return into;
+  const lists = getLists(first.transaction.doc);
   for (const ev of events) {
-    let t = ev.target;
+    let t: Y.AbstractType<unknown> | null = ev.target;
     if (t === lists) {
       // 리스트 자체가 생기거나 없어짐
-      for (const key of ev.keysChanged) if (!into.has(key)) into.set(key, null);
+      for (const key of ev.keys.keys()) into.set(key, null);
       continue;
     }
-    // 대상에서 위로 올라가며 문단(Y.Map)과 리스트(Y.Array)를 찾는다.
-    let para = null;
+    // 대상에서 위로 올라가며 문단 리스트(lists 의 바로 아래)를 찾는다.
+    let below: Y.AbstractType<unknown> | null = null;
     while (t && t.parent !== lists) {
-      para = t;
-      t = t.parent;
+      below = t;
+      t = t.parent as Y.AbstractType<unknown> | null;
     }
     if (!t) continue;
     const key = t._item?.parentSub;
     if (!key) continue;
-    if (into.get(key) === null && into.has(key)) continue;
+    if (into.has(key) && into.get(key) === null) continue;
     let set = into.get(key);
     if (!set) into.set(key, (set = new Set()));
-    // para 는 Y.Text 일 수도 있다 → 한 단계 위가 문단 맵
-    if (para) {
-      const map = para.parent === t ? para : para.parent;
-      const id = map?.get?.('id');
-      if (id) set.add(id);
+    // below 는 문단(Y.Map)이거나 그 안의 Y.Text 다.
+    if (below) {
+      const para = (below.parent === t ? below : below.parent) as Para | null;
+      const id = para?.get('id');
+      if (typeof id === 'string') set.add(id);
     }
   }
   return into;
