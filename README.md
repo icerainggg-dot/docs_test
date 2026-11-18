@@ -17,6 +17,8 @@ npm run build     # 웹 화면 빌드 (dist/web)
 npm start         # http://localhost:8787
 ```
 
+시험용 견본 문서는 `samples/시험서식.hwpx`에 있습니다(본문 문단과 2×2 표).
+
 개발할 때는 `npm run dev` (서버 8787 + Vite 5173).
 Docker: `docker build -t hwpx-coedit . && docker run -p 8787:8787 -v hwpx-data:/data hwpx-coedit`
 
