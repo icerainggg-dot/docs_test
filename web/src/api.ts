@@ -16,13 +16,27 @@ export interface DocMeta {
   filename: string;
   owner: string;
   editors: string[];
+  folderId: string | null;
   createdAt: string;
   updatedAt: string;
   save: { at: string; ok: boolean; diffs: number; error?: string; webdav: string | null } | null;
-  /** 나의 권한 */
-  role: 'owner' | 'editor';
+  /** 나의 권한: 올린 사람 / 문서 편집 권한 / 폴더 구성원이라서 */
+  role: 'owner' | 'editor' | 'folder';
   ownerUser: Person | null;
   editorUsers: Person[];
+  folder: { id: string; name: string } | null;
+}
+
+/** 업무 폴더 */
+export interface FolderInfo {
+  id: string;
+  name: string;
+  owner: string;
+  members: string[];
+  role: 'owner' | 'member';
+  ownerUser: Person | null;
+  memberUsers: Person[];
+  docCount: number;
 }
 
 export interface DocInfo extends DocMeta {
@@ -69,10 +83,12 @@ export const api = {
   logout: (): Promise<Response> => send('/api/auth/logout', 'POST'),
   searchUsers: (q: string): Promise<Person[]> => fetch(`/api/users?q=${encodeURIComponent(q)}`).then((r) => json<Person[]>(r)),
 
-  list: (): Promise<DocMeta[]> => fetch('/api/docs').then((r) => json<DocMeta[]>(r)),
+  /** folder: 폴더 id, 'none'(폴더 밖), 없으면 전체 */
+  list: (folder?: string): Promise<DocMeta[]> =>
+    fetch(folder ? `/api/docs?folder=${encodeURIComponent(folder)}` : '/api/docs').then((r) => json<DocMeta[]>(r)),
   get: (id: string): Promise<DocInfo> => fetch(`/api/docs/${id}`).then((r) => json<DocInfo>(r)),
-  create: (file: File | null, kind: DocKind = 'hwpx'): Promise<DocMeta> =>
-    fetch(`/api/docs?filename=${encodeURIComponent(file?.name || '')}&kind=${kind}`, {
+  create: (file: File | null, kind: DocKind = 'hwpx', folderId?: string | null): Promise<DocMeta> =>
+    fetch(`/api/docs?filename=${encodeURIComponent(file?.name || '')}&kind=${kind}${folderId ? `&folder=${folderId}` : ''}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/octet-stream' },
       body: file || new Uint8Array(),
@@ -81,6 +97,15 @@ export const api = {
   setEditors: (id: string, userIds: string[]): Promise<DocMeta> =>
     send(`/api/docs/${id}/editors`, 'PUT', { userIds }).then((r) => json<DocMeta>(r)),
   remove: (id: string): Promise<null> => send(`/api/docs/${id}`, 'DELETE').then((r) => json<null>(r)),
+  moveToFolder: (id: string, folderId: string | null): Promise<DocMeta> =>
+    send(`/api/docs/${id}/folder`, 'PUT', { folderId }).then((r) => json<DocMeta>(r)),
+
+  folders: (): Promise<FolderInfo[]> => fetch('/api/folders').then((r) => json<FolderInfo[]>(r)),
+  createFolder: (name: string): Promise<FolderInfo> => send('/api/folders', 'POST', { name }).then((r) => json<FolderInfo>(r)),
+  renameFolder: (id: string, name: string): Promise<FolderInfo> => send(`/api/folders/${id}`, 'PATCH', { name }).then((r) => json<FolderInfo>(r)),
+  setFolderMembers: (id: string, userIds: string[]): Promise<FolderInfo> =>
+    send(`/api/folders/${id}/members`, 'PUT', { userIds }).then((r) => json<FolderInfo>(r)),
+  removeFolder: (id: string): Promise<null> => send(`/api/folders/${id}`, 'DELETE').then((r) => json<null>(r)),
   base: async (id: string): Promise<Uint8Array> => {
     const res = await fetch(`/api/docs/${id}/base`);
     if (!res.ok) throw new ApiError('원본 문서를 받지 못했습니다.', res.status);

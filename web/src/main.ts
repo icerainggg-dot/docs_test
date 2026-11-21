@@ -25,6 +25,11 @@ async function route(root: HTMLElement): Promise<void> {
     cleanup = await showLogin(root);
     return;
   }
+  const folder = /^#\/f\/(none|f[a-z0-9]{11})$/.exec(location.hash);
+  if (folder?.[1]) {
+    cleanup = await showHome(root, folder[1]);
+    return;
+  }
   const m = /^#\/d\/([a-z0-9]{12})$/.exec(location.hash);
   if (!m?.[1]) {
     cleanup = await showHome(root);

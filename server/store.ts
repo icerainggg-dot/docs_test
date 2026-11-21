@@ -34,6 +34,8 @@ export interface DocMeta {
   owner: string;
   /** 동시편집 권한을 받은 사람들 */
   editors: string[];
+  /** 들어 있는 업무 폴더 (없으면 null) */
+  folderId: string | null;
   filename: string;
   createdAt: string;
   updatedAt: string;
@@ -76,6 +78,7 @@ export class Store {
     title: string;
     filename: string;
     owner: string;
+    folderId?: string | null;
     base: Uint8Array;
     ydocUpdate: Uint8Array;
     model?: unknown;
@@ -90,6 +93,7 @@ export class Store {
       title: input.title,
       owner: input.owner,
       editors: [],
+      folderId: input.folderId ?? null,
       filename: input.filename,
       createdAt: now,
       updatedAt: now,
@@ -107,6 +111,7 @@ export class Store {
       const meta = JSON.parse(await readFile(path.join(this.dir(id), 'meta.json'), 'utf8')) as DocMeta;
       meta.kind ??= 'hwpx'; // 예전 판에서 만든 문서
       meta.editors ??= [];
+      meta.folderId ??= null;
       return meta;
     } catch {
       return null;

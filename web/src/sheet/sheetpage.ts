@@ -62,7 +62,7 @@ export async function showSheet(root: HTMLElement, meta: DocInfo): Promise<() =>
   const toolbar = h(
     'header',
     { class: 'toolbar' },
-    h('a', { href: '#/', class: 'tool back', title: '문서 목록', 'aria-label': '문서 목록' }, '←'),
+    h('a', { href: meta.folderId ? `#/f/${meta.folderId}` : '#/', class: 'tool back', title: meta.folder ? `${meta.folder.name} 폴더로` : '문서 목록', 'aria-label': '문서 목록' }, '←'),
     titleField(meta, flash, SUFFIX),
     h('span', { class: 'sep' }),
     tool('↶', '실행 취소 (Ctrl+Z)', () => ed.undo()),

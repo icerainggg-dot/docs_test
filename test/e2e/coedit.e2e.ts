@@ -43,6 +43,7 @@ interface Locator {
   first(): Locator;
   textContent(): Promise<string | null>;
   getAttribute(name: string): Promise<string | null>;
+  selectOption(value: { label: string }): Promise<unknown>;
   setInputFiles(file: { name: string; mimeType: string; buffer: Buffer }): Promise<void>;
   waitFor(opts?: { state?: string; timeout?: number }): Promise<void>;
 }
@@ -52,6 +53,7 @@ interface Page {
   url(): string;
   on(event: 'pageerror', fn: (e: Error) => void): void;
   on(event: 'console', fn: (m: { type(): string; text(): string }) => void): void;
+  once(event: 'dialog', fn: (d: { accept(text?: string): Promise<void> }) => void): void;
   waitForSelector(sel: string, opts?: { timeout?: number }): Promise<unknown>;
   waitForURL(re: RegExp): Promise<void>;
   waitForFunction(fn: () => unknown): Promise<unknown>;
@@ -315,13 +317,68 @@ try {
     d.free();
   }
 
+  if (shots) await narae.screenshot({ path: path.join(shots, '5-revoked.png') });
+
+  // ── 4) 업무 폴더: 구성원은 문서마다 공유받지 않아도 폴더 안 문서를 연다 ──
+  await garam.goto(`${origin}/#/`);
+  await garam.waitForSelector('.doc-list li');
+  garam.once('dialog', (d) => void d.accept('2027 예산 편성'));
+  await garam.getByRole('button', { name: '+ 새 폴더' }).click();
+  await garam.waitForURL(/#\/f\/f[a-z0-9]{11}$/);
+  const folderId = garam.url().split('/').pop()!;
+  await garam.waitForSelector('.folder-head >> text=2027 예산 편성');
+
+  // 구성원 추가
+  await garam.getByRole('button', { name: '구성원 관리' }).click();
+  await garam.getByLabel('사람 찾기').fill('다온');
+  await garam.getByRole('button', { name: '구성원으로 추가' }).click();
+  await garam.waitForSelector('dialog.share .members >> text=박다온');
+  await garam.getByRole('button', { name: '닫기' }).click();
+
+  // 폴더 안에 새 엑셀 문서 만들기 → 폴더 화면으로 돌아와 기존 한글 문서도 옮기기
+  await garam.getByRole('button', { name: '빈 엑셀 문서' }).click();
+  await garam.waitForURL(/#\/d\/[a-z0-9]{12}$/);
+  await garam.waitForFunction(() => window.__grid);
+  const inFolder = garam.url().split('/').pop()!;
+  assert.equal((await srv.store.meta(inFolder))!.folderId, folderId, '폴더 안에 만들어진다');
+  await garam.locator('.tool.back').click();
+  await garam.waitForURL(new RegExp(`#/f/${folderId}$`));
+  await garam.goto(`${origin}/#/`);
+  await garam.waitForSelector('.doc-list li');
+  await garam.getByLabel('"시험 서식" 폴더 옮기기').selectOption({ label: '2027 예산 편성' });
+  await waitFor(async () => (await srv.store.meta(hwpxId))!.folderId === folderId, '문서 옮기기');
+
+  // 다온: 폴더가 보이고, 폴더 안 문서 두 개를 연다 (아까는 열 수 없던 한글 문서 포함)
+  await daon.goto(`${origin}/#/`);
+  await daon.reload();
+  await daon.getByRole('link', { name: /2027 예산 편성/ }).click();
+  await daon.waitForURL(new RegExp(`#/f/${folderId}$`));
+  await waitFor(async () => (await daon.locator('.doc-list li .doc-title').count()) === 2, '폴더 안 문서 두 개');
+  await daon.getByRole('link', { name: '시험 서식', exact: true }).click();
+  await daon.waitForFunction(() => window.__editor);
+  assert.equal(((await bodyTexts(daon))[0] ?? '').startsWith('동시편집 시험 문서'), true, '폴더 구성원으로 한글 문서를 연다');
+
   if (shots) {
-    await daon.goto(`${origin}/#/`);
+    await garam.goto(`${origin}/#/f/${folderId}`);
+    await garam.waitForSelector('.doc-list li .doc-title');
+    await garam.screenshot({ path: path.join(shots, '1-folder.png') });
     await garam.goto(`${origin}/#/`);
-    await garam.waitForSelector('.doc-list li');
+    await garam.waitForSelector('.doc-list li .doc-title');
     await garam.screenshot({ path: path.join(shots, '1-home.png') });
-    await narae.screenshot({ path: path.join(shots, '5-revoked.png') });
   }
+
+  // 구성원에서 빼면 열어 둔 화면이 막힌다.
+  await srv.folders.update(folderId, { members: [] });
+  await garam.goto(`${origin}/#/f/${folderId}`);
+  await garam.waitForSelector('.folder-head');
+  await garam.getByRole('button', { name: '구성원 관리' }).click();
+  await garam.waitForSelector('dialog.share >> text=아직 구성원이 없습니다.');
+  await garam.getByLabel('사람 찾기').fill('다온');
+  await garam.getByRole('button', { name: '구성원으로 추가' }).click();
+  await garam.waitForSelector('dialog.share .members >> text=박다온');
+  await garam.getByRole('button', { name: '빼기', exact: true }).click();
+  await garam.waitForSelector('dialog.share >> text=아직 구성원이 없습니다.');
+  await daon.waitForSelector('.blocker', { timeout: 5000 });
 
   assert.equal(failed, false, '페이지 오류가 없어야 한다');
   console.log('✓ 동시편집 e2e 시험 통과');
