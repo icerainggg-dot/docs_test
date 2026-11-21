@@ -33,6 +33,8 @@ export function connectCollab(id: string): Collab {
   provider.on('authenticationFailed', deny);
   provider.on('close', ({ event }: { event: { reason?: string } }) => {
     if (event?.reason === 'Forbidden') deny();
+    // 편집↔보기 권한이 바뀌면 새 권한으로 다시 연다.
+    if (event?.reason === 'RoleChanged') location.reload();
   });
   const ready = new Promise<'synced' | 'denied' | 'timeout'>((resolve) => {
     const timer = setTimeout(() => resolve('timeout'), 15000);
@@ -93,8 +95,13 @@ export function shareButton(meta: DocMeta): HTMLButtonElement {
   return h(
     'button',
     { class: 'btn small', type: 'button', onclick: () => openShareDialog(meta, (m) => Object.assign(meta, m)) },
-    meta.role === 'owner' ? '공유' : '함께 편집하는 사람',
+    meta.role === 'owner' ? '공유' : '권한',
   );
+}
+
+/** 보기 권한일 때 도구 모음에 붙이는 표시 */
+export function readOnlyBadge(meta: DocMeta): HTMLElement | null {
+  return meta.role === 'view' ? h('span', { class: 'ro', title: '보기 권한으로 열었습니다. 고칠 수 없습니다.' }, '보기 전용') : null;
 }
 
 export interface PeerView {

@@ -15,7 +15,7 @@ import { cellKey } from '../../src/shared/xlsx/types.ts';
 import type { WorkbookModel } from '../../src/shared/xlsx/types.ts';
 import * as ops from '../../src/shared/ops.ts';
 
-type DocInfo = DocMeta & { versions: string[]; role: string; editorUsers: { id: string; name: string }[] };
+type DocInfo = Omit<DocMeta, 'shares'> & { versions: string[]; role: string; shares: { id: string; name: string; role: string }[] };
 
 const upload = async (a: Agent, name: string, bytes: Uint8Array): Promise<Response> =>
   a.fetch(`/api/docs?filename=${encodeURIComponent(name)}`, { method: 'POST', body: Buffer.from(bytes) });
@@ -93,18 +93,19 @@ test('편집 권한: 올린 사람이 지정한 사람만 열고 고칠 수 있�
     early.destroy();
 
     // 사람 찾기 → 편집 권한 주기
-    const found = (await (await owner.fetch('/api/users?q=편집')).json()) as { id: string; username: string }[];
-    assert.deepEqual(found.map((u) => u.username), ['bob']);
-    const share = await owner.json(`/api/docs/${doc.id}/editors`, 'PUT', { userIds: [bob.id, 'u-없는사람', owner.id] });
+    const found = (await (await owner.fetch('/api/people?q=편집')).json()) as { users: { id: string; username: string }[] };
+    assert.deepEqual(found.users.map((u) => u.username), ['bob']);
+    const grant = (id: string, role = 'edit'): { type: string; id: string; role: string } => ({ type: 'user', id, role });
+    const share = await owner.json(`/api/docs/${doc.id}/shares`, 'PUT', { grants: [grant(bob.id), grant('u-없는사람'), grant(owner.id)] });
     assert.equal(share.status, 200);
-    assert.deepEqual(((await share.json()) as DocInfo).editorUsers.map((u) => u.name), ['최편집']);
+    assert.deepEqual(((await share.json()) as DocInfo).shares.map((u) => [u.name, u.role]), [['최편집', 'edit']]);
 
     const seen = (await (await bob.fetch('/api/docs')).json()) as DocInfo[];
-    assert.deepEqual(seen.map((d) => [d.id, d.role]), [[doc.id, 'editor']]);
+    assert.deepEqual(seen.map((d) => [d.id, d.role]), [[doc.id, 'edit']]);
     assert.equal((await carol.fetch(`/api/docs/${doc.id}`)).status, 404);
 
     // 편집자는 고칠 수 있지만 권한을 주거나 지우거나 이름을 바꿀 수는 없다.
-    assert.equal((await bob.json(`/api/docs/${doc.id}/editors`, 'PUT', { userIds: [carol.id] })).status, 403);
+    assert.equal((await bob.json(`/api/docs/${doc.id}/shares`, 'PUT', { grants: [grant(carol.id)] })).status, 403);
     assert.equal((await bob.fetch(`/api/docs/${doc.id}`, { method: 'DELETE' })).status, 403);
     assert.equal((await bob.json(`/api/docs/${doc.id}`, 'PATCH', { title: '바꿈' })).status, 403);
 
@@ -114,17 +115,38 @@ test('편집 권한: 올린 사람이 지정한 사람만 열고 고칠 수 있�
     getCells(b.ydoc).set(cellKey(0, 'B3'), { t: 'n', v: 1500000 });
     await until(() => (getCells(a.ydoc).get(cellKey(0, 'B3')) as { v?: number } | undefined)?.v === 1500000);
 
+    // 보기 권한으로 바꾸면 다시 열어야 하고, 보기 권한으로 보낸 편집은 서버가 받지 않는다.
+    await owner.json(`/api/docs/${doc.id}/shares`, 'PUT', { grants: [grant(bob.id, 'view')] });
+    await until(() => b.closedReason === 'RoleChanged', 3000);
+    b.destroy();
+    const viewer = bob.connect(t.port, doc.id);
+    assert.equal(await viewer.result, 'synced', '보기 권한도 열 수는 있다');
+    getCells(viewer.ydoc).set(cellKey(0, 'B6'), { t: 'n', v: 777 });
+    getCells(a.ydoc).set(cellKey(0, 'B7'), { t: 'n', v: 888 });
+    await until(() => getCells(viewer.ydoc).has(cellKey(0, 'B7')), 3000);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(getCells(a.ydoc).get(cellKey(0, 'B6')), undefined, '보기 권한의 편집은 다른 사람에게 가지 않는다');
+    const late = owner.connect(t.port, doc.id);
+    await late.result;
+    assert.equal(getCells(late.ydoc).get(cellKey(0, 'B6')), undefined, '서버에도 남지 않는다');
+    late.destroy();
+    await owner.json(`/api/docs/${doc.id}/shares`, 'PUT', { grants: [grant(bob.id)] });
+    await until(() => viewer.closedReason === 'RoleChanged', 3000);
+    viewer.destroy();
+    const b2 = bob.connect(t.port, doc.id);
+    await b2.result;
+
     // 권한을 거두면 바로 끊기고 다시 들어올 수 없다.
-    await owner.json(`/api/docs/${doc.id}/editors`, 'PUT', { userIds: [] });
-    await until(() => b.denied, 3000);
+    await owner.json(`/api/docs/${doc.id}/shares`, 'PUT', { grants: [] });
+    await until(() => b2.denied, 3000);
     const retry = bob.connect(t.port, doc.id);
     assert.equal(await timeout(retry.result, 3000, 'timeout' as const), 'denied');
     // 끊긴 뒤 보낸 편집은 다른 사람에게 가지 않는다.
-    getCells(b.ydoc).set(cellKey(0, 'B4'), { t: 'n', v: 1 });
+    getCells(b2.ydoc).set(cellKey(0, 'B4'), { t: 'n', v: 1 });
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(getCells(a.ydoc).get(cellKey(0, 'B4')), undefined);
     retry.destroy();
-    b.destroy();
+    b2.destroy();
     assert.equal((await bob.fetch(`/api/docs/${doc.id}`)).status, 404);
     a.destroy();
   } finally {
@@ -153,7 +175,7 @@ test('HWPX: 올리기 → 두 사람이 동시편집 → 저장·내보내기·W
     const meta = (await (await upload(kim, '시험 서식.hwpx', sampleHwpx())).json()) as DocInfo;
     assert.equal(meta.title, '시험 서식');
     assert.equal(meta.kind, 'hwpx');
-    await kim.json(`/api/docs/${meta.id}/editors`, 'PUT', { userIds: [lee.id] });
+    await kim.json(`/api/docs/${meta.id}/shares`, 'PUT', { grants: [{ type: 'user', id: lee.id, role: 'edit' }] });
 
     const a = kim.connect(t.port, meta.id);
     const b = lee.connect(t.port, meta.id);
@@ -203,7 +225,7 @@ test('XLSX: 올리기 → 두 사람이 셀을 고침 → 저장된 파일에 �
     const kim = await new Agent(t.origin).signup('kim', '김가람');
     const lee = await new Agent(t.origin).signup('lee', '이나래');
     const meta = (await (await upload(kim, '예산.xlsx', await sampleXlsx())).json()) as DocInfo;
-    await kim.json(`/api/docs/${meta.id}/editors`, 'PUT', { userIds: [lee.id] });
+    await kim.json(`/api/docs/${meta.id}/shares`, 'PUT', { grants: [{ type: 'user', id: lee.id, role: 'edit' }] });
 
     const model = (await (await lee.fetch(`/api/docs/${meta.id}/model`)).json()) as WorkbookModel;
     assert.deepEqual(model.sheets.map((s) => s.name), ['예산', '요약']);

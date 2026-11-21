@@ -81,6 +81,7 @@ export class Agent {
     // 따로 만든 연결을 넘기면 직접 붙여야 한다.
     provider.attach();
     let denied = false;
+    let closedReason = '';
     const result = new Promise<'synced' | 'denied'>((resolve) => {
       provider.on('synced', () => resolve('synced'));
       provider.on('authenticationFailed', () => {
@@ -89,6 +90,7 @@ export class Agent {
       });
       // 접속 중에 권한을 잃으면 서버가 그 문서 연결만 닫는다.
       provider.on('close', ({ event }: { event: { reason?: string } }) => {
+        closedReason = event?.reason ?? '';
         if (event?.reason === 'Forbidden') {
           denied = true;
           resolve('denied');
@@ -101,6 +103,9 @@ export class Agent {
       result,
       get denied() {
         return denied;
+      },
+      get closedReason() {
+        return closedReason;
       },
       destroy() {
         provider.destroy();
@@ -115,6 +120,8 @@ export interface Client {
   provider: HocuspocusProvider;
   result: Promise<'synced' | 'denied'>;
   readonly denied: boolean;
+  /** 서버가 이 문서 연결을 닫은 까닭 (Forbidden, RoleChanged) */
+  readonly closedReason: string;
   destroy(): void;
 }
 

@@ -83,6 +83,8 @@ export class Editor {
   readonly undoManager: Y.UndoManager;
   /** rHWP 문서가 바뀔 때마다 올라간다 (쪽 다시 그리기 판단용) */
   rev = 0;
+  /** 보기 권한: 커서와 선택은 되지만 고칠 수 없다 (서버도 편집을 받지 않는다) */
+  readOnly = false;
 
   private sel: { anchor: Y.RelativePosition; head: Y.RelativePosition } | null = null;
   private lastHead: EdPos | null = null;
@@ -335,7 +337,7 @@ export class Editor {
   }
 
   type(text: string): void {
-    if (!text) return;
+    if (!text || this.readOnly) return;
     const s = this.selection();
     const key = s.start.key;
     const list = this.list(key);
@@ -347,6 +349,7 @@ export class Editor {
   }
 
   enter(): void {
+    if (this.readOnly) return;
     const s = this.selection();
     const key = s.start.key;
     const list = this.list(key);
@@ -359,13 +362,14 @@ export class Editor {
 
   deleteSelection(): boolean {
     const s = this.selection();
-    if (s.collapsed) return false;
+    if (s.collapsed || this.readOnly) return false;
     const p = this.transact(() => this.deleteSelectionIn(s));
     this.setCaret({ key: s.start.key, ...p });
     return true;
   }
 
   backspace(): void {
+    if (this.readOnly) return;
     if (this.deleteSelection()) return;
     const { head } = this.selection();
     const list = this.list(head.key);
@@ -382,6 +386,7 @@ export class Editor {
   }
 
   del(): void {
+    if (this.readOnly) return;
     if (this.deleteSelection()) return;
     const { head } = this.selection();
     const list = this.list(head.key);
@@ -400,7 +405,7 @@ export class Editor {
   /** 덧입힌 서식 켬/끔. 예: toggleFormat('b') */
   toggleFormat(attr: Exclude<OverlayKey, 'col'>): boolean {
     const s = this.selection();
-    if (s.collapsed) return false;
+    if (s.collapsed || this.readOnly) return false;
     const list = this.list(s.start.key);
     const on = !ops.rangeHasAttr(list, s.start.idx, s.start.off, s.end.idx, s.end.off, attr, true);
     this.undoManager.stopCapturing(); // 서식 변경은 앞선 입력과 따로 실행 취소되게 한다
@@ -412,7 +417,7 @@ export class Editor {
 
   setColor(color: string): boolean {
     const s = this.selection();
-    if (s.collapsed) return false;
+    if (s.collapsed || this.readOnly) return false;
     const list = this.list(s.start.key);
     this.undoManager.stopCapturing();
     this.transact(() => ops.formatRange(list, s.start.idx, s.start.off, s.end.idx, s.end.off, { col: color }));
@@ -433,11 +438,13 @@ export class Editor {
   }
 
   undo(): void {
+    if (this.readOnly) return;
     this.undoManager.undo();
     this.emit('selection');
   }
 
   redo(): void {
+    if (this.readOnly) return;
     this.undoManager.redo();
     this.emit('selection');
   }
@@ -469,6 +476,7 @@ export class Editor {
   // ── 한글(IME) 조합 ──────────────────────────────────────────
 
   beginComposition(): void {
+    if (this.readOnly) return;
     this.deleteSelection();
     const { head } = this.selection();
     const p = this.list(head.key).get(head.idx);

@@ -83,7 +83,7 @@ input {
 
 /* ── 첫 화면 ── */
 .home {
-  max-width: 1080px;
+  max-width: 1120px;
   margin: 0 auto;
   padding: 40px 16px 80px;
 }
@@ -940,4 +940,204 @@ select.move {
 }
 .actions .status:empty {
   display: none;
+}
+
+/* ── 폴더 트리·보기 전용 ── */
+.folders a.lv1 {
+  padding-left: 26px;
+}
+.folders a.lv2 {
+  padding-left: 42px;
+}
+.crumbs {
+  margin: 0 0 2px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.crumbs a {
+  color: var(--muted);
+}
+.ro {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  vertical-align: middle;
+}
+.toolbar .ro {
+  margin: 0 4px;
+  flex: none;
+}
+.tool:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.sheet.readonly .gbody {
+  cursor: default;
+}
+.tag {
+  margin-right: 4px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+.search-row {
+  display: flex;
+  gap: 6px;
+}
+.search-row select,
+.members select {
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+}
+@media (max-width: 720px) {
+  .folders a.lv1,
+  .folders a.lv2 {
+    padding-left: 10px;
+  }
+  .folders a.lv1 .fname::before {
+    content: '› ';
+  }
+  .folders a.lv2 .fname::before {
+    content: '›› ';
+  }
+}
+
+/* ── 관리 화면 ── */
+.admin section.card {
+  margin-top: 16px;
+}
+.admin h2 {
+  margin: 0;
+  font-size: 18px;
+}
+.sec-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.admin input:not([type='checkbox']),
+.admin select,
+.admin textarea {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  max-width: 100%;
+}
+.org-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+.org-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0 6px calc(var(--lv, 0) * 22px);
+  border-top: 1px solid var(--line);
+}
+.dname {
+  flex: 1 1 180px;
+  font-weight: 600;
+}
+.dcount,
+.ext {
+  margin-left: 6px;
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--muted);
+}
+.dactions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+label.inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.add-user {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin: 8px 0 12px;
+}
+.add-user input {
+  width: 130px;
+}
+.table-wrap {
+  overflow-x: auto;
+}
+table.users {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+table.users th,
+table.users td {
+  padding: 6px 8px;
+  border-top: 1px solid var(--line);
+  text-align: left;
+  vertical-align: middle;
+}
+table.users th {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 600;
+}
+table.users td.c {
+  text-align: center;
+}
+table.users .sub {
+  font-size: 12px;
+  color: var(--muted);
+}
+table.users tr.inactive td {
+  opacity: 0.55;
+}
+.title-in {
+  width: 100px;
+}
+.admin textarea {
+  width: 100%;
+  font-family: ui-monospace, 'D2Coding', monospace;
+  font-size: 13px;
+  margin: 6px 0;
+}
+.sync-out {
+  white-space: pre-wrap;
+  font-size: 12px;
+  color: var(--muted);
+  margin: 6px 0 0;
+}
+.admin .add-user input:not([type='checkbox']) {
+  width: 140px;
+  max-width: 100%;
+}
+.admin .add-user label.inline {
+  margin: 0 4px;
 }

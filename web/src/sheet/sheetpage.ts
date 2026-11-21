@@ -6,7 +6,7 @@ import { session, colorFor } from '../session.ts';
 import type { WorkbookModel } from '../../../src/shared/xlsx/types.ts';
 import { SheetEditor } from './sheet-editor.ts';
 import { SheetGrid } from './grid.ts';
-import { connectCollab, denyOverlay, flasher, titleField, shareButton, peerAvatars, statusWidgets } from '../shell.ts';
+import { connectCollab, denyOverlay, flasher, titleField, shareButton, peerAvatars, statusWidgets, readOnlyBadge } from '../shell.ts';
 
 declare global {
   interface Window {
@@ -46,6 +46,7 @@ export async function showSheet(root: HTMLElement, meta: DocInfo): Promise<() =>
 
   const me = session.user!;
   const ed = new SheetEditor({ model, ydoc: collab.ydoc, awareness, user: { name: me.name, color: colorFor(me.id) } });
+  ed.readOnly = meta.role === 'view';
   cleanups.push(() => ed.destroy());
   window.__sheet = ed;
 
@@ -64,9 +65,9 @@ export async function showSheet(root: HTMLElement, meta: DocInfo): Promise<() =>
     { class: 'toolbar' },
     h('a', { href: meta.folderId ? `#/f/${meta.folderId}` : '#/', class: 'tool back', title: meta.folder ? `${meta.folder.name} 폴더로` : '문서 목록', 'aria-label': '문서 목록' }, '←'),
     titleField(meta, flash, SUFFIX),
+    readOnlyBadge(meta),
     h('span', { class: 'sep' }),
-    tool('↶', '실행 취소 (Ctrl+Z)', () => ed.undo()),
-    tool('↷', '다시 실행 (Ctrl+Y)', () => ed.redo()),
+    ...(ed.readOnly ? [] : [tool('↶', '실행 취소 (Ctrl+Z)', () => ed.undo()), tool('↷', '다시 실행 (Ctrl+Y)', () => ed.redo())]),
     h('span', { class: 'grow' }),
     peersEl,
     status.conn,

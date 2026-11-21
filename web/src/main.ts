@@ -4,6 +4,7 @@ import { showLogin } from './login.ts';
 import { showHome } from './home.ts';
 import { showDoc } from './docpage.ts';
 import { showSheet } from './sheet/sheetpage.ts';
+import { showAdmin } from './admin.ts';
 
 const app = document.getElementById('app');
 if (!app) throw new Error('#app 이 없습니다.');
@@ -23,6 +24,10 @@ async function route(root: HTMLElement): Promise<void> {
   }
   if (location.hash.startsWith('#/login')) {
     cleanup = await showLogin(root);
+    return;
+  }
+  if (location.hash === '#/admin') {
+    cleanup = await showAdmin(root);
     return;
   }
   const folder = /^#\/f\/(none|f[a-z0-9]{11})$/.exec(location.hash);

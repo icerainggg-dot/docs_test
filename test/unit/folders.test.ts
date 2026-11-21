@@ -6,91 +6,145 @@ import { startServer, Agent, timeout, until } from './server-helpers.ts';
 interface FolderInfo {
   id: string;
   name: string;
-  role: 'owner' | 'member';
-  memberUsers: { id: string; name: string }[];
+  parentId: string | null;
+  depth: number;
+  canAddChild: boolean;
+  role: string;
+  grants: { type: string; id: string; role: string; name: string }[];
+  path: { id: string; name: string }[];
   docCount: number;
 }
 interface DocInfo {
   id: string;
-  title: string;
   role: string;
   folderId: string | null;
-  folder: { id: string; name: string } | null;
+  path: { name: string }[];
 }
 
 const json = async <T>(r: Response): Promise<T> => (await r.json()) as T;
+const user = (id: string, role = 'edit'): object => ({ type: 'user', id, role });
+const dept = (id: string, role = 'edit'): object => ({ type: 'dept', id, role });
 
-test('업무 폴더: 구성원은 폴더 안 문서를 모두 열고 고칠 수 있다', async () => {
+test('업무 폴더: 3단계까지, 위 폴더 권한은 아래로 이어진다', async () => {
   const t = await startServer();
   try {
     const lead = await new Agent(t.origin).signup('lead', '팀장');
     const mate = await new Agent(t.origin).signup('mate', '팀원');
+    const guest = await new Agent(t.origin).signup('guest', '참관인');
     const other = await new Agent(t.origin).signup('other', '외부인');
 
-    // 폴더 만들기
     assert.equal((await lead.json('/api/folders', 'POST', { name: '   ' })).status, 400);
-    const f = await json<FolderInfo>(await lead.json('/api/folders', 'POST', { name: '2027 예산 편성' }));
-    assert.equal(f.role, 'owner');
-    assert.deepEqual(await json(await mate.fetch('/api/folders')), [], '구성원이 아니면 폴더가 보이지 않는다');
-    assert.equal((await mate.fetch(`/api/folders/${f.id}`)).status, 404);
+    const top = await json<FolderInfo>(await lead.json('/api/folders', 'POST', { name: '2027 예산' }));
+    const mid = await json<FolderInfo>(await lead.json('/api/folders', 'POST', { name: '본예산', parentId: top.id }));
+    const low = await json<FolderInfo>(await lead.json('/api/folders', 'POST', { name: '정보화', parentId: mid.id }));
+    assert.deepEqual([top.depth, mid.depth, low.depth], [1, 2, 3]);
+    assert.deepEqual(low.path.map((p) => p.name), ['2027 예산', '본예산', '정보화']);
+    assert.equal(low.canAddChild, false);
+    const fourth = await lead.json('/api/folders', 'POST', { name: '넷째', parentId: low.id });
+    assert.equal(fourth.status, 400, '4단계는 만들 수 없다');
+    assert.match(((await fourth.json()) as { error: string }).error, /3단계/);
 
-    // 폴더 안에 문서 올리기
+    // 맨 아래 폴더에 문서
     const doc = await json<DocInfo>(
-      await lead.fetch(`/api/docs?filename=${encodeURIComponent('예산.xlsx')}&folder=${f.id}`, { method: 'POST', body: Buffer.from(await sampleXlsx()) }),
+      await lead.fetch(`/api/docs?filename=a.xlsx&folder=${low.id}`, { method: 'POST', body: Buffer.from(await sampleXlsx()) }),
     );
-    assert.equal(doc.folderId, f.id);
-    assert.deepEqual(doc.folder, { id: f.id, name: '2027 예산 편성' });
-    // 구성원이 아닌 폴더에는 올릴 수 없다.
-    assert.equal((await other.fetch(`/api/docs?kind=xlsx&folder=${f.id}`, { method: 'POST' })).status, 404);
-    assert.equal((await mate.fetch(`/api/docs/${doc.id}`)).status, 404, '구성원이 되기 전에는 볼 수 없다');
+    assert.deepEqual(doc.path.map((p) => p.name), ['2027 예산', '본예산', '정보화']);
+    assert.deepEqual(await json(await mate.fetch('/api/folders')), []);
 
-    // 구성원 추가 → 문서마다 권한을 주지 않아도 열린다.
-    const added = await json<FolderInfo>(await lead.json(`/api/folders/${f.id}/members`, 'PUT', { userIds: [mate.id, 'u없는사람'] }));
-    assert.deepEqual(added.memberUsers.map((u) => u.name), ['팀원']);
+    // 맨 위 폴더에 팀원(편집)·참관인(보기) → 아래 폴더와 문서에도
+    const set = await lead.json(`/api/folders/${top.id}/grants`, 'PUT', { grants: [user(mate.id), user(guest.id, 'view'), user(lead.id), user('u없음')] });
+    assert.deepEqual(((await set.json()) as FolderInfo).grants.map((g) => [g.name, g.role]), [['팀원', 'edit'], ['참관인', 'view']]);
     const mateFolders = await json<FolderInfo[]>(await mate.fetch('/api/folders'));
-    assert.deepEqual(mateFolders.map((x) => [x.name, x.role, x.docCount]), [['2027 예산 편성', 'member', 1]]);
-    const seen = await json<DocInfo[]>(await mate.fetch(`/api/docs?folder=${f.id}`));
-    assert.deepEqual(seen.map((d) => [d.id, d.role]), [[doc.id, 'folder']]);
-    assert.deepEqual(await json(await mate.fetch('/api/docs?folder=none')), []);
+    assert.deepEqual(mateFolders.map((f) => [f.name, f.role]).sort(), [['2027 예산', 'edit'], ['본예산', 'edit'], ['정보화', 'edit']]);
+    assert.equal((await json<DocInfo>(await mate.fetch(`/api/docs/${doc.id}`))).role, 'edit');
+    assert.equal((await json<DocInfo>(await guest.fetch(`/api/docs/${doc.id}`))).role, 'view');
     assert.equal((await other.fetch(`/api/docs/${doc.id}`)).status, 404);
 
-    // 구성원도 폴더에 문서를 올릴 수 있고, 그 문서는 팀장도 연다.
-    const byMate = await json<DocInfo>(await mate.fetch(`/api/docs?kind=hwpx&folder=${f.id}`, { method: 'POST' }));
-    assert.equal((await lead.fetch(`/api/docs/${byMate.id}`)).status, 200);
+    // 편집 권한이 있으면 하위 폴더·문서를 만들 수 있고, 보기 권한은 못 한다.
+    const byMate = await mate.json('/api/folders', 'POST', { name: '팀원 폴더', parentId: mid.id });
+    assert.equal(byMate.status, 201);
+    assert.equal((await guest.json('/api/folders', 'POST', { name: 'x', parentId: mid.id })).status, 403);
+    assert.equal((await guest.fetch(`/api/docs?kind=xlsx&folder=${mid.id}`, { method: 'POST' })).status, 403);
+    assert.equal((await mate.fetch(`/api/docs?kind=hwpx&folder=${mid.id}`, { method: 'POST' })).status, 201);
+    // 구성원은 권한을 바꾸지 못하고, 위 폴더를 만든 사람은 아래 폴더 권한도 바꿀 수 있다.
+    assert.equal((await mate.json(`/api/folders/${low.id}/grants`, 'PUT', { grants: [] })).status, 403);
+    const mateFolder = await json<FolderInfo>(byMate);
+    assert.equal((await lead.json(`/api/folders/${mateFolder.id}`, 'PATCH', { name: '팀원 폴더(정리)' })).status, 200);
 
-    // 구성원은 구성원을 바꾸거나 폴더를 지울 수 없다.
-    assert.equal((await mate.json(`/api/folders/${f.id}/members`, 'PUT', { userIds: [other.id] })).status, 403);
-    assert.equal((await mate.fetch(`/api/folders/${f.id}`, { method: 'DELETE' })).status, 403);
-    assert.equal((await mate.json(`/api/folders/${f.id}`, 'PATCH', { name: '바꿈' })).status, 403);
-    // 남이 올린 문서를 다른 곳으로 옮길 수도 없다.
-    assert.equal((await mate.json(`/api/docs/${doc.id}/folder`, 'PUT', { folderId: null })).status, 403);
+    // 보기 권한 실시간 연결은 읽기 전용
+    const g = guest.connect(t.port, doc.id);
+    assert.equal(await timeout(g.result, 4000, 'timeout' as const), 'synced');
+    // 아래 폴더에서 참관인에게 편집 권한을 더 주면 그 폴더에서는 편집이 된다 (가장 높은 권한).
+    await lead.json(`/api/folders/${low.id}/grants`, 'PUT', { grants: [user(guest.id)] });
+    await until(() => g.closedReason === 'RoleChanged', 3000);
+    g.destroy();
+    assert.equal((await json<DocInfo>(await guest.fetch(`/api/docs/${doc.id}`))).role, 'edit');
 
-    // 폴더 구성원으로 실시간 접속 → 구성원에서 빼면 끊긴다.
-    const c = mate.connect(t.port, doc.id);
-    assert.equal(await timeout(c.result, 4000, 'timeout' as const), 'synced');
-    await lead.json(`/api/folders/${f.id}/members`, 'PUT', { userIds: [] });
+    // 맨 위 폴더 권한을 거두면 아래 폴더 문서도 닫힌다 (아래 폴더에 따로 받은 권한은 남는다).
+    const m = mate.connect(t.port, doc.id);
+    await m.result;
+    await lead.json(`/api/folders/${top.id}/grants`, 'PUT', { grants: [] });
+    await until(() => m.denied, 3000);
+    m.destroy();
+    assert.equal((await mate.fetch(`/api/docs/${doc.id}`)).status, 404);
+    assert.equal((await json<DocInfo>(await guest.fetch(`/api/docs/${doc.id}`))).role, 'edit');
+
+    // 가운데 폴더를 지우면 아래 폴더도 지워지고, 문서는 맨 위 폴더로 올라온다.
+    assert.equal((await lead.fetch(`/api/folders/${mid.id}`, { method: 'DELETE' })).status, 204);
+    assert.equal((await lead.fetch(`/api/folders/${low.id}`)).status, 404);
+    assert.equal((await json<DocInfo>(await lead.fetch(`/api/docs/${doc.id}`))).folderId, top.id);
+    // 문서 옮기기: 편집 권한이 있는 폴더로만
+    const theirs = await json<FolderInfo>(await other.json('/api/folders', 'POST', { name: '남의 폴더' }));
+    assert.equal((await lead.json(`/api/docs/${doc.id}/folder`, 'PUT', { folderId: theirs.id })).status, 404);
+    await other.json(`/api/folders/${theirs.id}/grants`, 'PUT', { grants: [user(lead.id, 'view')] });
+    assert.equal((await lead.json(`/api/docs/${doc.id}/folder`, 'PUT', { folderId: theirs.id })).status, 403, '보기 권한 폴더로는 못 옮긴다');
+    assert.equal((await json<DocInfo>(await lead.json(`/api/docs/${doc.id}/folder`, 'PUT', { folderId: null }))).folderId, null);
+  } finally {
+    await t.close();
+  }
+});
+
+test('부서 단위 권한: 하위 부서까지, 조직도가 바뀌면 권한도 따라간다', async () => {
+  const t = await startServer();
+  try {
+    const admin = await new Agent(t.origin).signup('admin', '관리자'); // 첫 계정 = 관리자
+    const kim = await new Agent(t.origin).signup('kim', '김정보');
+    const lee = await new Agent(t.origin).signup('lee', '이기획');
+
+    const mk = async (name: string, parentId: string | null = null): Promise<{ id: string }> =>
+      json(await admin.json('/api/admin/org', 'POST', { name, parentId }));
+    const hq = await mk('기획조정실');
+    const it = await mk('정보화담당관', hq.id);
+    const team = await mk('정보운영팀', it.id);
+    const plan = await mk('기획예산담당관', hq.id);
+    await admin.json(`/api/admin/users/${kim.id}`, 'PATCH', { deptId: team.id, title: '주무관' });
+    await admin.json(`/api/admin/users/${lee.id}`, 'PATCH', { deptId: plan.id });
+
+    // 정보화담당관(하위 정보운영팀 포함)에 편집 권한
+    const doc = await json<DocInfo>(await admin.fetch('/api/docs?kind=xlsx', { method: 'POST' }));
+    const found = await json<{ depts: { id: string; path: string }[] }>(await admin.fetch('/api/people?q=정보화'));
+    assert.deepEqual(found.depts.map((d) => d.path), ['기획조정실 > 정보화담당관']);
+    await admin.json(`/api/docs/${doc.id}/shares`, 'PUT', { grants: [dept(it.id)] });
+    assert.equal((await json<DocInfo>(await kim.fetch(`/api/docs/${doc.id}`))).role, 'edit', '하위 부서 사람도');
+    assert.equal((await lee.fetch(`/api/docs/${doc.id}`)).status, 404, '다른 부서는 안 됨');
+
+    // 김정보가 기획예산담당관으로 옮기면 권한이 없어지고, 열어 둔 화면도 끊긴다.
+    const c = kim.connect(t.port, doc.id);
+    assert.equal(await c.result, 'synced');
+    await admin.json(`/api/admin/users/${kim.id}`, 'PATCH', { deptId: plan.id });
     await until(() => c.denied, 3000);
     c.destroy();
-    assert.equal((await mate.fetch(`/api/docs/${doc.id}`)).status, 404);
-    // 자기가 올린 문서는 폴더 구성원에서 빠져도 계속 볼 수 있다.
-    assert.equal((await mate.fetch(`/api/docs/${byMate.id}`)).status, 200);
+    assert.equal((await kim.fetch(`/api/docs/${doc.id}`)).status, 404);
 
-    // 폴더 밖 문서를 폴더로 옮기기
-    const loose = await json<DocInfo>(await lead.fetch('/api/docs?kind=xlsx', { method: 'POST' }));
-    assert.equal(loose.folderId, null);
-    const other2 = await json<FolderInfo>(await other.json('/api/folders', 'POST', { name: '남의 폴더' }));
-    assert.equal((await lead.json(`/api/docs/${loose.id}/folder`, 'PUT', { folderId: other2.id })).status, 404, '구성원이 아닌 폴더로는 못 옮긴다');
-    const moved = await json<DocInfo>(await lead.json(`/api/docs/${loose.id}/folder`, 'PUT', { folderId: f.id }));
-    assert.equal(moved.folderId, f.id);
+    // 부서를 옮기면(조직 개편) 그 아래 사람의 권한도 바뀐다.
+    await admin.json(`/api/admin/org/${plan.id}`, 'PATCH', { parentId: it.id });
+    assert.equal((await json<DocInfo>(await lee.fetch(`/api/docs/${doc.id}`))).role, 'edit');
+    assert.equal((await admin.json(`/api/admin/org/${it.id}`, 'PATCH', { parentId: team.id })).status, 400, '자기 아래로는 못 옮긴다');
 
-    // 이름 바꾸기, 지우기 (문서는 남고 폴더 밖으로)
-    assert.equal((await json<FolderInfo>(await lead.json(`/api/folders/${f.id}`, 'PATCH', { name: '2027 예산(확정)' }))).name, '2027 예산(확정)');
-    await lead.json(`/api/folders/${f.id}/members`, 'PUT', { userIds: [mate.id] });
-    assert.equal((await lead.fetch(`/api/folders/${f.id}`, { method: 'DELETE' })).status, 204);
-    const after = await json<DocInfo>(await lead.fetch(`/api/docs/${doc.id}`));
-    assert.equal(after.folderId, null);
-    assert.equal((await mate.fetch(`/api/docs/${doc.id}`)).status, 404, '폴더가 없어지면 구성원 권한도 없어진다');
-    assert.equal((await lead.fetch(`/api/folders/${f.id}`)).status, 404);
+    // 구성원이 있거나 하위 부서가 있으면 지울 수 없다. 지운 부서의 권한은 없어진다.
+    assert.equal((await admin.fetch(`/api/admin/org/${plan.id}`, { method: 'DELETE' })).status, 400);
+    assert.equal((await admin.fetch(`/api/admin/org/${hq.id}`, { method: 'DELETE' })).status, 400);
+    assert.equal((await admin.fetch(`/api/admin/org/${team.id}`, { method: 'DELETE' })).status, 204);
   } finally {
     await t.close();
   }

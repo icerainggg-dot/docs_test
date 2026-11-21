@@ -1,63 +1,68 @@
-// 사람 고르기 창: 문서의 편집자, 폴더의 구성원을 정할 때 함께 쓴다.
+// 권한 창: 문서 공유와 폴더 권한에 함께 쓴다.
+// 사람이나 부서를 찾아 "편집" 또는 "보기" 권한을 준다. 부서에 주면 하위 부서 사람까지 포함된다.
 
 import { api, h, errorMessage } from './api.ts';
-import type { DocMeta, FolderInfo, Person } from './api.ts';
+import type { DocMeta, FolderInfo, Grant, GrantRole, GrantView, Person } from './api.ts';
 
-interface PeopleOptions {
+interface GrantOptions {
   title: string;
   hint: string;
   ownerLabel: string;
-  memberLabel: string;
-  addLabel: string;
-  removeLabel: string;
-  emptyText: string;
   owner: Person | null;
   ownerId: string;
-  members: Person[];
+  grants: GrantView[];
   canManage: boolean;
-  /** 구성원 목록을 저장하고 새 목록을 돌려준다. */
-  save(ids: string[]): Promise<Person[]>;
+  /** 권한 목록을 저장하고 새 목록을 돌려준다. */
+  save(grants: Grant[]): Promise<GrantView[]>;
 }
 
-export function openPeopleDialog(o: PeopleOptions): void {
-  let members = o.members;
+const ROLE_LABEL: Record<GrantRole, string> = { edit: '편집', view: '보기' };
+
+export function openGrantDialog(o: GrantOptions): void {
+  let grants = o.grants;
   const dialog = h('dialog', { class: 'share', 'aria-labelledby': 'share-title' });
   const status = h('p', { class: 'status', role: 'status' });
   const list = h('ul', { class: 'members' });
   const results = h('ul', { class: 'results' });
-  const search = h('input', { type: 'search', placeholder: '이름이나 아이디로 찾기', 'aria-label': '사람 찾기', autocomplete: 'off' });
+  const search = h('input', { type: 'search', placeholder: '이름·아이디·부서로 찾기', 'aria-label': '사람이나 부서 찾기', autocomplete: 'off' });
+  const newRole = h('select', { 'aria-label': '줄 권한' }, h('option', { value: 'edit' }, '편집'), h('option', { value: 'view' }, '보기'));
 
-  const save = async (ids: string[]): Promise<void> => {
+  const plain = (g: GrantView): Grant => ({ type: g.type, id: g.id, role: g.role });
+  const save = async (next: Grant[]): Promise<void> => {
     try {
-      members = await o.save(ids);
+      grants = await o.save(next);
       render();
-      results.replaceChildren();
-      search.value = '';
       status.textContent = '저장했습니다.';
     } catch (e) {
       status.textContent = errorMessage(e);
     }
   };
 
-  const person = (p: Person, note: string, action?: HTMLElement): HTMLLIElement =>
-    h('li', {}, h('span', { class: 'who' }, h('b', {}, p.name), ` ${p.username}`), h('span', { class: 'note' }, note), action ?? null);
+  const row = (label: HTMLElement, note: HTMLElement | string, ...actions: (HTMLElement | null)[]): HTMLLIElement =>
+    h('li', {}, label, typeof note === 'string' ? h('span', { class: 'note' }, note) : note, ...actions);
+  const who = (name: string, sub: string, dept: boolean): HTMLElement =>
+    h('span', { class: 'who' }, dept ? h('span', { class: 'tag' }, '부서') : null, h('b', {}, name), ` ${sub}`);
 
   function render(): void {
     list.replaceChildren(
-      ...(o.owner ? [person(o.owner, o.ownerLabel)] : []),
-      ...members.map((p) =>
-        person(
-          p,
-          o.memberLabel,
-          o.canManage
-            ? h('button', { class: 'btn small danger', type: 'button', onclick: () => void save(members.filter((x) => x.id !== p.id).map((x) => x.id)) }, o.removeLabel)
-            : undefined,
-        ),
-      ),
+      ...(o.owner ? [row(who(o.owner.name, o.owner.username, false), o.ownerLabel)] : []),
+      ...grants.map((g) => {
+        const label = who(g.name, g.sub + (g.active === false ? ' (사용 중지)' : ''), g.type === 'dept');
+        if (!o.canManage) return row(label, ROLE_LABEL[g.role]);
+        const sel = h('select', { 'aria-label': `${g.name} 권한` }, h('option', { value: 'edit' }, '편집'), h('option', { value: 'view' }, '보기'));
+        sel.value = g.role;
+        sel.addEventListener('change', () => void save(grants.map((x) => (x === g ? { ...plain(x), role: sel.value as GrantRole } : plain(x)))));
+        return row(
+          label,
+          sel,
+          h('button', { class: 'btn small danger', type: 'button', onclick: () => void save(grants.filter((x) => x !== g).map(plain)) }, '빼기'),
+        );
+      }),
     );
-    if (!members.length) list.append(h('li', { class: 'empty' }, o.emptyText));
+    if (!grants.length) list.append(h('li', { class: 'empty' }, '아직 권한을 받은 사람이나 부서가 없습니다.'));
   }
 
+  const add = (g: Grant): void => void save([...grants.filter((x) => !(x.type === g.type && x.id === g.id)).map(plain), g]);
   let timer: ReturnType<typeof setTimeout> | undefined;
   search.addEventListener('input', () => {
     clearTimeout(timer);
@@ -68,18 +73,25 @@ export function openPeopleDialog(o: PeopleOptions): void {
         return;
       }
       try {
-        const found = await api.searchUsers(q);
+        const found = await api.people(q);
+        const has = (type: string, id: string): boolean => (type === 'user' && id === o.ownerId) || grants.some((g) => g.type === type && g.id === id);
         results.replaceChildren(
-          ...found.map((p) => {
-            const already = p.id === o.ownerId || members.some((m) => m.id === p.id);
-            return person(
-              p,
-              already ? '이미 들어 있음' : '',
-              already ? undefined : h('button', { class: 'btn small primary', type: 'button', onclick: () => void save([...members.map((m) => m.id), p.id]) }, o.addLabel),
-            );
-          }),
+          ...found.depts.map((d) =>
+            row(
+              who(d.name, d.path, true),
+              has('dept', d.id) ? '이미 있음' : '하위 부서 포함',
+              has('dept', d.id) ? null : h('button', { class: 'btn small primary', type: 'button', onclick: () => add({ type: 'dept', id: d.id, role: newRole.value as GrantRole }) }, '추가'),
+            ),
+          ),
+          ...found.users.map((p) =>
+            row(
+              who(p.name, [p.username, p.dept, p.title].filter(Boolean).join(' · '), false),
+              has('user', p.id) ? '이미 있음' : '',
+              has('user', p.id) ? null : h('button', { class: 'btn small primary', type: 'button', onclick: () => add({ type: 'user', id: p.id, role: newRole.value as GrantRole }) }, '추가'),
+            ),
+          ),
         );
-        if (!found.length) results.append(h('li', { class: 'empty' }, '찾는 사람이 없습니다.'));
+        if (!found.users.length && !found.depts.length) results.append(h('li', { class: 'empty' }, '찾는 사람이나 부서가 없습니다.'));
       } catch (e) {
         status.textContent = errorMessage(e);
       }
@@ -90,7 +102,7 @@ export function openPeopleDialog(o: PeopleOptions): void {
     h('h2', { id: 'share-title' }, o.title),
     h('p', { class: 'hint' }, o.hint),
     list,
-    ...(o.canManage ? [h('div', { class: 'search' }, search, results)] : []),
+    ...(o.canManage ? [h('div', { class: 'search' }, h('div', { class: 'search-row' }, search, newRole), results)] : []),
     status,
     h('form', { method: 'dialog', class: 'actions' }, h('button', { class: 'btn', value: 'close' }, '닫기')),
   );
@@ -101,53 +113,45 @@ export function openPeopleDialog(o: PeopleOptions): void {
   if (o.canManage) search.focus();
 }
 
-/** 문서 공유 창: 올린 사람이 문서마다 편집 권한을 준다. */
+/** 문서 공유 창: 올린 사람이 문서마다 권한을 준다. */
 export function openShareDialog(meta: DocMeta, onChange: (m: DocMeta) => void): void {
   const owner = meta.role === 'owner';
-  const folderNote = meta.folder ? ` "${meta.folder.name}" 폴더의 구성원도 이 문서를 고칠 수 있습니다.` : '';
-  openPeopleDialog({
-    title: `"${meta.title}" 함께 편집`,
-    hint: (owner ? '권한을 받은 사람만 이 문서를 열고 고칠 수 있습니다.' : '권한은 문서를 올린 사람만 바꿀 수 있습니다.') + folderNote,
+  const where = meta.path.length ? ` "${meta.path.map((p) => p.name).join(' > ')}" 폴더에 권한이 있는 사람도 이 문서를 열 수 있습니다.` : '';
+  openGrantDialog({
+    title: `"${meta.title}" 권한`,
+    hint: (owner ? '편집 권한은 고칠 수 있고, 보기 권한은 읽고 내려받기만 할 수 있습니다.' : '권한은 문서를 올린 사람만 바꿀 수 있습니다.') + where,
     ownerLabel: '올린 사람',
-    memberLabel: '편집 가능',
-    addLabel: '편집 권한 주기',
-    removeLabel: '권한 빼기',
-    emptyText: '아직 함께 편집하는 사람이 없습니다.',
     owner: meta.ownerUser,
     ownerId: meta.owner,
-    members: meta.editorUsers,
+    grants: meta.shares,
     canManage: owner,
-    async save(ids) {
-      const m = await api.setEditors(meta.id, ids);
+    async save(grants) {
+      const m = await api.setShares(meta.id, grants);
       Object.assign(meta, m);
       onChange(m);
-      return m.editorUsers;
+      return m.shares;
     },
   });
 }
 
-/** 폴더 구성원 창: 폴더를 만든 사람이 구성원을 정한다. */
-export function openFolderMembers(folder: FolderInfo, onChange: (f: FolderInfo) => void): void {
+/** 폴더 권한 창: 폴더(또는 상위 폴더)를 만든 사람이 권한을 정한다. 아래 폴더와 문서에도 그대로 간다. */
+export function openFolderGrants(folder: FolderInfo, onChange: (f: FolderInfo) => void): void {
   const owner = folder.role === 'owner';
-  openPeopleDialog({
-    title: `"${folder.name}" 구성원`,
+  openGrantDialog({
+    title: `"${folder.name}" 폴더 권한`,
     hint: owner
-      ? '구성원은 이 폴더의 모든 문서를 열고 고칠 수 있고, 폴더에 새 문서를 올릴 수 있습니다.'
-      : '구성원은 폴더를 만든 사람만 바꿀 수 있습니다.',
+      ? '여기서 준 권한은 이 폴더의 하위 폴더와 모든 문서에 그대로 갑니다. 편집 권한이 있으면 문서와 하위 폴더를 만들 수 있습니다.'
+      : '권한은 폴더를 만든 사람만 바꿀 수 있습니다. 상위 폴더에서 받은 권한도 이 폴더에 적용됩니다.',
     ownerLabel: '만든 사람',
-    memberLabel: '구성원',
-    addLabel: '구성원으로 추가',
-    removeLabel: '빼기',
-    emptyText: '아직 구성원이 없습니다.',
     owner: folder.ownerUser,
     ownerId: folder.owner,
-    members: folder.memberUsers,
+    grants: folder.grants,
     canManage: owner,
-    async save(ids) {
-      const f = await api.setFolderMembers(folder.id, ids);
+    async save(grants) {
+      const f = await api.setFolderGrants(folder.id, grants);
       Object.assign(folder, f);
       onChange(f);
-      return f.memberUsers;
+      return f.grants;
     },
   });
 }

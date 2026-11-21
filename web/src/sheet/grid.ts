@@ -175,6 +175,11 @@ export class SheetGrid {
       }),
     );
     this.fx.value = this.activeRaw();
+    if (ed.readOnly) {
+      this.fx.readOnly = true;
+      this.input.readOnly = true;
+      root.classList.add('readonly');
+    }
     this.schedule();
   }
 
@@ -414,6 +419,10 @@ export class SheetGrid {
   // ── 편집 ───────────────────────────────────────────────────
 
   private startEdit(mode: Exclude<EditMode, null>, initial?: string): void {
+    if (this.ed.readOnly) {
+      this.input.value = '';
+      return;
+    }
     this.mode = mode;
     if (initial !== undefined) {
       this.input.value = initial;

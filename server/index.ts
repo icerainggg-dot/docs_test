@@ -1,6 +1,6 @@
 // 동시편집 서버 (HWPX·XLSX).
-//   - REST  : 로그인, 문서 올리기/목록/원본/내보내기/버전, 편집 권한 주기
-//   - WS    : Hocuspocus(Yjs) 동기화 — 같은 포트의 WebSocket 업그레이드, 문서 권한 확인
+//   - REST  : 로그인, 업무 폴더, 문서 올리기/목록/원본/내보내기/버전, 권한(편집·보기, 사람·부서), 관리자
+//   - WS    : Hocuspocus(Yjs) 동기화 — 같은 포트의 WebSocket 업그레이드, 문서 권한 확인(보기 권한은 읽기 전용)
 //   - 저장  : 편집이 멈추면 원본 + Y 상태로 파일을 다시 만들어 저장
 
 import { existsSync } from 'node:fs';
@@ -25,8 +25,12 @@ import type { WebDav } from './webdav.ts';
 import { UserStore, UserError } from './users.ts';
 import type { User } from './users.ts';
 import { authRouter, requireUser, checkOrigin, parseCookies, sameOrigin, COOKIE } from './auth.ts';
-import { FolderStore } from './folders.ts';
+import { FolderStore, MAX_FOLDER_DEPTH } from './folders.ts';
 import type { Folder } from './folders.ts';
+import { OrgStore } from './org.ts';
+import { Access, atLeast } from './access.ts';
+import type { Grant, Role, Who } from './access.ts';
+import { adminRouter } from './admin.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -53,6 +57,8 @@ export interface CoeditServer {
   store: Store;
   users: UserStore;
   folders: FolderStore;
+  org: OrgStore;
+  access: Access;
   listen(port?: number, host?: string): Promise<number>;
   close(): Promise<void>;
 }
@@ -60,6 +66,7 @@ export interface CoeditServer {
 /** 실시간 접속마다 붙는 정보 */
 interface ConnContext {
   userId: string;
+  readOnly: boolean;
 }
 
 const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
@@ -68,10 +75,6 @@ const MIME: Record<DocKind, string> = {
   hwpx: 'application/hwp+zip',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 };
-
-/** 문서를 열고 고칠 수 있는지: 올린 사람, 편집 권한을 받은 사람, 문서가 든 폴더의 구성원 */
-export const canEdit = (meta: DocMeta, userId: string, folder?: Folder | null): boolean =>
-  meta.owner === userId || meta.editors.includes(userId) || (!!folder && meta.folderId === folder.id && FolderStore.isMember(folder, userId));
 
 /** 올린 파일의 종류를 알아낸다. */
 function detectKind(bytes: Uint8Array, filename: string): DocKind {
@@ -103,10 +106,8 @@ export async function createServer({
   const store = new Store(dataDir);
   const users = new UserStore(dataDir);
   const folders = new FolderStore(dataDir);
-
-  async function canAccess(meta: DocMeta, userId: string): Promise<boolean> {
-    return canEdit(meta, userId, await folders.get(meta.folderId));
-  }
+  const org = new OrgStore(dataDir);
+  const access = new Access(folders, org, users);
 
   // XLSX 해석 결과는 문서마다 한 번만 읽는다.
   const models = new Map<string, WorkbookModel>();
@@ -160,20 +161,20 @@ export async function createServer({
     return bytes;
   }
 
-  /** 권한이 빠진 사람의 실시간 접속을 끊는다. */
-  async function kickUnauthorized(id: string, meta: DocMeta | null): Promise<void> {
-    const doc = hocuspocus.documents.get(id);
-    if (!doc) return;
-    const folder = meta ? await folders.get(meta.folderId) : null;
-    for (const conn of doc.getConnections()) {
-      const ctx = conn.context as ConnContext | undefined;
-      if (!meta || !ctx || !canEdit(meta, ctx.userId, folder)) conn.close({ code: 4403, reason: 'Forbidden' });
+  /**
+   * 열려 있는 모든 실시간 연결의 권한을 다시 검사한다 (권한·조직·계정이 바뀐 뒤).
+   * 권한이 없어졌으면 끊고(Forbidden), 편집↔보기가 바뀌었으면 끊어서 새 권한으로 다시 열게 한다(RoleChanged).
+   */
+  async function recheck(): Promise<void> {
+    for (const [id, doc] of hocuspocus.documents) {
+      const meta = await store.meta(id);
+      for (const conn of doc.getConnections()) {
+        const ctx = conn.context as ConnContext | undefined;
+        const role = meta && ctx ? await access.docRole(meta, await access.who(ctx.userId)) : null;
+        if (!role) conn.close({ code: 4403, reason: 'Forbidden' });
+        else if ((role === 'view') !== ctx!.readOnly) conn.close({ code: 4409, reason: 'RoleChanged' });
+      }
     }
-  }
-
-  /** 폴더 안 문서들의 접속을 다시 검사한다 (구성원이 바뀌거나 폴더가 없어졌을 때). */
-  async function recheckFolder(folderId: string): Promise<void> {
-    for (const m of await store.list()) if (m.folderId === folderId) await kickUnauthorized(m.id, m);
   }
 
   const app = express();
@@ -193,147 +194,124 @@ export async function createServer({
     res.status(404).json({ error: `${what} 찾을 수 없습니다.` });
   };
   const me = (req: Request): User => req.user!;
+  const whoOf = (req: Request): Promise<Who> => access.who(me(req));
 
-  /** 경로의 문서를 읽고 권한을 확인한다. 권한이 없으면 문서가 없는 것처럼 답한다. */
-  async function docFor(req: Request, res: Response, { ownerOnly = false } = {}): Promise<DocMeta | null> {
-    const id = String(req.params.id);
-    const meta = Store.isId(id) ? await store.meta(id) : null;
-    if (!meta || !(await canAccess(meta, me(req).id))) {
-      notFound(res);
-      return null;
+  // ── 화면에 보낼 모양 ──
+  const personView = async (u: User): Promise<object> => ({
+    id: u.id,
+    username: u.username,
+    name: u.name,
+    title: u.title,
+    dept: u.deptId ? await org.pathName(u.deptId) : '',
+  });
+
+  async function grantsView(grants: Grant[]): Promise<object[]> {
+    const people = new Map((await users.getMany(grants.filter((g) => g.type === 'user').map((g) => g.id))).map((u) => [u.id, u]));
+    const out: object[] = [];
+    for (const g of grants) {
+      if (g.type === 'user') {
+        const u = people.get(g.id);
+        if (u) out.push({ ...g, name: u.name, sub: u.username, active: u.active });
+      } else {
+        const d = await org.get(g.id);
+        if (d) out.push({ ...g, name: d.name, sub: await org.pathName(d.id) });
+      }
     }
-    if (ownerOnly && meta.owner !== me(req).id) {
-      res.status(403).json({ error: '문서를 올린 사람만 할 수 있습니다.' });
-      return null;
-    }
-    return meta;
+    return out;
   }
 
-  /** 화면에 보낼 사람 정보 */
-  async function people(ids: string[]): Promise<Map<string, { id: string; username: string; name: string }>> {
-    const list = await users.getMany(ids);
-    return new Map(list.map((u) => [u.id, { id: u.id, username: u.username, name: u.name }]));
+  async function folderPath(folderId: string | null): Promise<{ id: string; name: string }[]> {
+    return (await folders.chain(folderId)).reverse().map((f) => ({ id: f.id, name: f.name }));
   }
 
-  /** 화면에 보낼 문서 정보 (소유자·편집자 이름, 폴더 포함) */
-  async function docView(meta: DocMeta, userId: string): Promise<object> {
-    const byId = await people([meta.owner, ...meta.editors]);
+  async function docView(meta: DocMeta, role: Role): Promise<object> {
+    const owner = await users.get(meta.owner);
     const folder = await folders.get(meta.folderId);
     return {
       ...meta,
-      role: meta.owner === userId ? 'owner' : meta.editors.includes(userId) ? 'editor' : 'folder',
-      ownerUser: byId.get(meta.owner) ?? null,
-      editorUsers: meta.editors.map((id) => byId.get(id)).filter(Boolean),
+      role,
+      ownerUser: owner ? await personView(owner) : null,
+      shares: await grantsView(meta.shares),
       folder: folder ? { id: folder.id, name: folder.name } : null,
+      path: await folderPath(meta.folderId),
     };
   }
 
-  /** 화면에 보낼 폴더 정보 */
-  async function folderView(f: Folder, userId: string, docCount: number): Promise<object> {
-    const byId = await people([f.owner, ...f.members]);
+  async function folderView(f: Folder, role: Role, docCount: number): Promise<object> {
+    const owner = await users.get(f.owner);
+    const chain = await folders.chain(f.id);
     return {
       id: f.id,
       name: f.name,
+      parentId: f.parentId,
+      depth: chain.length,
+      canAddChild: chain.length < MAX_FOLDER_DEPTH && atLeast(role, 'edit'),
       owner: f.owner,
-      members: f.members,
-      createdAt: f.createdAt,
-      role: f.owner === userId ? 'owner' : 'member',
-      ownerUser: byId.get(f.owner) ?? null,
-      memberUsers: f.members.map((id) => byId.get(id)).filter(Boolean),
+      role,
+      ownerUser: owner ? await personView(owner) : null,
+      grants: await grantsView(f.grants),
+      path: chain.reverse().map((x) => ({ id: x.id, name: x.name })),
       docCount,
+      createdAt: f.createdAt,
     };
   }
 
-  /** 폴더를 읽고 구성원인지 확인한다. 아니면 없는 것처럼 답한다. */
-  async function folderFor(req: Request, res: Response, { ownerOnly = false } = {}): Promise<Folder | null> {
-    const f = await folders.get(String(req.params.fid));
-    if (!f || !FolderStore.isMember(f, me(req).id)) {
+  /** 경로의 문서를 읽고 권한을 확인한다. 권한이 없으면 문서가 없는 것처럼 답한다. */
+  async function docFor(req: Request, res: Response, need: Role = 'view'): Promise<{ meta: DocMeta; role: Role } | null> {
+    const id = String(req.params.id);
+    const meta = Store.isId(id) ? await store.meta(id) : null;
+    const role = meta ? await access.docRole(meta, await whoOf(req)) : null;
+    if (!meta || !role) {
+      notFound(res);
+      return null;
+    }
+    if (!atLeast(role, need)) {
+      res.status(403).json({ error: need === 'owner' ? '문서를 올린 사람만 할 수 있습니다.' : '편집 권한이 없습니다.' });
+      return null;
+    }
+    return { meta, role };
+  }
+
+  /** 경로의 폴더를 읽고 권한을 확인한다. */
+  async function folderFor(req: Request, res: Response, need: Role = 'view'): Promise<{ folder: Folder; role: Role } | null> {
+    const folder = await folders.get(String(req.params.fid));
+    const role = folder ? await access.folderRole(folder.id, await whoOf(req)) : null;
+    if (!folder || !role) {
       notFound(res, '폴더를');
       return null;
     }
-    if (ownerOnly && f.owner !== me(req).id) {
-      res.status(403).json({ error: '폴더를 만든 사람만 할 수 있습니다.' });
+    if (!atLeast(role, need)) {
+      res.status(403).json({ error: need === 'owner' ? '폴더를 만든 사람(또는 상위 폴더를 만든 사람)만 할 수 있습니다.' : '이 폴더의 편집 권한이 없습니다.' });
       return null;
     }
-    return f;
+    return { folder, role };
   }
 
-  api.get('/users', asyncRoute(async (req, res) => {
+  // ── 사람·부서 찾기 (권한 줄 때) ──
+  api.get('/people', asyncRoute(async (req, res) => {
     const q = String(req.query.q ?? '').slice(0, 50);
-    const found = await users.search(q);
-    res.json(found.filter((u) => u.id !== me(req).id).map((u) => ({ id: u.id, username: u.username, name: u.name })));
+    const found = (await users.search(q)).filter((u) => u.id !== me(req).id);
+    const depts = await org.search(q);
+    res.json({
+      users: await Promise.all(found.map(personView)),
+      depts: await Promise.all(depts.map(async (d) => ({ id: d.id, name: d.name, path: await org.pathName(d.id) }))),
+    });
   }));
+
+  // ── 문서 ──
 
   // 문서 목록. ?folder=<폴더 id> 면 그 폴더만, ?folder=none 이면 폴더에 넣지 않은 것만.
   api.get('/docs', asyncRoute(async (req, res) => {
-    const uid = me(req).id;
-    const myFolders = new Map((await folders.forUser(uid)).map((f) => [f.id, f]));
+    const who = await whoOf(req);
     const filter = typeof req.query.folder === 'string' ? req.query.folder : '';
-    const mine = (await store.list()).filter((m) => {
-      if (!canEdit(m, uid, m.folderId ? myFolders.get(m.folderId) : null)) return false;
-      if (filter === 'none') return !m.folderId || !myFolders.has(m.folderId);
-      if (filter) return m.folderId === filter;
-      return true;
-    });
-    res.json(await Promise.all(mine.map((m) => docView(m, uid))));
-  }));
-
-  // ── 업무 폴더 ──
-  api.get('/folders', asyncRoute(async (req, res) => {
-    const uid = me(req).id;
-    const list = await folders.forUser(uid);
-    const docs = await store.list();
-    res.json(await Promise.all(list.map((f) => folderView(f, uid, docs.filter((d) => d.folderId === f.id).length))));
-  }));
-
-  api.post('/folders', express.json(), asyncRoute(async (req, res) => {
-    const body = req.body as { name?: unknown } | undefined;
-    const f = await folders.create(String(body?.name ?? ''), me(req).id);
-    res.status(201).json(await folderView(f, me(req).id, 0));
-  }));
-
-  api.get('/folders/:fid', asyncRoute(async (req, res) => {
-    const f = await folderFor(req, res);
-    if (!f) return;
-    const count = (await store.list()).filter((d) => d.folderId === f.id).length;
-    res.json(await folderView(f, me(req).id, count));
-  }));
-
-  api.patch('/folders/:fid', express.json(), asyncRoute(async (req, res) => {
-    const f = await folderFor(req, res, { ownerOnly: true });
-    if (!f) return;
-    const body = req.body as { name?: unknown } | undefined;
-    const updated = await folders.update(f.id, { name: String(body?.name ?? '') });
-    res.json(await folderView(updated, me(req).id, (await store.list()).filter((d) => d.folderId === f.id).length));
-  }));
-
-  // 폴더 구성원 정하기: 만든 사람이 구성원 목록을 통째로 정한다.
-  api.put('/folders/:fid/members', express.json(), asyncRoute(async (req, res) => {
-    const f = await folderFor(req, res, { ownerOnly: true });
-    if (!f) return;
-    const body = req.body as { userIds?: unknown } | undefined;
-    const ids = Array.isArray(body?.userIds) ? body.userIds.filter((x): x is string => typeof x === 'string') : null;
-    if (!ids) {
-      res.status(400).json({ error: 'userIds 가 필요합니다.' });
-      return;
-    }
-    const known = (await users.getMany(ids)).map((u) => u.id);
-    const updated = await folders.update(f.id, { members: known });
-    await recheckFolder(f.id);
-    res.json(await folderView(updated, me(req).id, (await store.list()).filter((d) => d.folderId === f.id).length));
-  }));
-
-  // 폴더 지우기: 안의 문서는 지우지 않고 폴더 밖으로 꺼낸다.
-  api.delete('/folders/:fid', asyncRoute(async (req, res) => {
-    const f = await folderFor(req, res, { ownerOnly: true });
-    if (!f) return;
-    await folders.remove(f.id);
+    const out: object[] = [];
     for (const m of await store.list()) {
-      if (m.folderId !== f.id) continue;
-      const updated = await store.updateMeta(m.id, { folderId: null });
-      await kickUnauthorized(m.id, updated);
+      if (filter === 'none' && m.folderId && (await access.folderRole(m.folderId, who))) continue;
+      if (filter && filter !== 'none' && m.folderId !== filter) continue;
+      const role = await access.docRole(m, who);
+      if (role) out.push(await docView(m, role));
     }
-    res.status(204).end();
+    res.json(out);
   }));
 
   // 문서 만들기: 본문에 파일 바이트를 실어 보내면 그 문서로, 비어 있으면 ?kind= 의 빈 문서로 시작한다.
@@ -342,8 +320,10 @@ export async function createServer({
     let folderId: string | null = null;
     if (req.query.folder) {
       const f = await folders.get(String(req.query.folder));
-      if (!f || !FolderStore.isMember(f, me(req).id)) {
-        res.status(404).json({ error: '폴더를 찾을 수 없습니다.' });
+      const role = f ? await access.folderRole(f.id, await whoOf(req)) : null;
+      if (!f || !role) return notFound(res, '폴더를');
+      if (!atLeast(role, 'edit')) {
+        res.status(403).json({ error: '이 폴더에 문서를 올릴 권한이 없습니다(보기 권한).' });
         return;
       }
       folderId = f.id;
@@ -378,97 +358,83 @@ export async function createServer({
       res.status(400).json({ error: `문서를 열 수 없습니다: ${errorMessage(e)}` });
       return;
     }
-    const meta = await store.create({
-      kind,
-      title,
-      filename,
-      owner: me(req).id,
-      folderId,
-      base,
-      ydocUpdate: Y.encodeStateAsUpdate(ydoc),
-      model,
-    });
+    const meta = await store.create({ kind, title, filename, owner: me(req).id, folderId, base, ydocUpdate: Y.encodeStateAsUpdate(ydoc), model });
     if (model) models.set(meta.id, model);
-    res.status(201).json(await docView(meta, me(req).id));
+    res.status(201).json(await docView(meta, 'owner'));
   }));
 
   api.get('/docs/:id', asyncRoute(async (req, res) => {
-    const meta = await docFor(req, res);
-    if (!meta) return;
-    res.json({ ...(await docView(meta, me(req).id)), versions: await store.versions(meta.id) });
+    const d = await docFor(req, res);
+    if (!d) return;
+    res.json({ ...(await docView(d.meta, d.role)), versions: await store.versions(d.meta.id) });
   }));
 
   api.patch('/docs/:id', express.json(), asyncRoute(async (req, res) => {
-    const meta = await docFor(req, res, { ownerOnly: true });
-    if (!meta) return;
+    const d = await docFor(req, res, 'owner');
+    if (!d) return;
     const body = req.body as { title?: unknown } | undefined;
     const title = String(body?.title || '').trim().slice(0, 200);
     if (!title) {
       res.status(400).json({ error: '제목이 비어 있습니다.' });
       return;
     }
-    const updated = await store.updateMeta(meta.id, { title });
-    res.json(await docView(updated!, me(req).id));
+    const updated = await store.updateMeta(d.meta.id, { title });
+    res.json(await docView(updated!, d.role));
   }));
 
-  // 편집 권한 주기: 올린 사람이 편집자 목록을 통째로 정한다.
-  api.put('/docs/:id/editors', express.json(), asyncRoute(async (req, res) => {
-    const meta = await docFor(req, res, { ownerOnly: true });
-    if (!meta) return;
-    const body = req.body as { userIds?: unknown } | undefined;
-    const ids = Array.isArray(body?.userIds) ? body.userIds.filter((x): x is string => typeof x === 'string') : null;
-    if (!ids) {
-      res.status(400).json({ error: 'userIds 가 필요합니다.' });
-      return;
-    }
-    const known = await users.getMany(ids);
-    const editors = [...new Set(known.map((u) => u.id))].filter((id) => id !== meta.owner).slice(0, 200);
-    const updated = await store.updateMeta(meta.id, { editors });
-    await kickUnauthorized(meta.id, updated);
-    res.json(await docView(updated!, me(req).id));
+  // 문서 권한: 올린 사람이 사람·부서별 편집/보기 권한 목록을 통째로 정한다.
+  api.put('/docs/:id/shares', express.json(), asyncRoute(async (req, res) => {
+    const d = await docFor(req, res, 'owner');
+    if (!d) return;
+    const shares = await access.cleanGrants((req.body as { grants?: unknown } | undefined)?.grants, [d.meta.owner]);
+    const updated = await store.updateMeta(d.meta.id, { shares });
+    await recheck();
+    res.json(await docView(updated!, d.role));
   }));
 
-  // 문서를 폴더에 넣거나 꺼낸다. 문서를 올린 사람이 자신이 구성원인 폴더로만 옮길 수 있다.
+  // 문서를 폴더에 넣거나 꺼낸다. 문서를 올린 사람이, 편집 권한이 있는 폴더로만 옮길 수 있다.
   api.put('/docs/:id/folder', express.json(), asyncRoute(async (req, res) => {
-    const meta = await docFor(req, res, { ownerOnly: true });
-    if (!meta) return;
+    const d = await docFor(req, res, 'owner');
+    if (!d) return;
     const body = req.body as { folderId?: unknown } | undefined;
     let folderId: string | null = null;
     if (body?.folderId) {
       const f = await folders.get(String(body.folderId));
-      if (!f || !FolderStore.isMember(f, me(req).id)) {
-        res.status(404).json({ error: '폴더를 찾을 수 없습니다.' });
+      const role = f ? await access.folderRole(f.id, await whoOf(req)) : null;
+      if (!f || !role) return notFound(res, '폴더를');
+      if (!atLeast(role, 'edit')) {
+        res.status(403).json({ error: '이 폴더에 문서를 넣을 권한이 없습니다(보기 권한).' });
         return;
       }
       folderId = f.id;
     }
-    const updated = await store.updateMeta(meta.id, { folderId });
-    await kickUnauthorized(meta.id, updated);
-    res.json(await docView(updated!, me(req).id));
+    const updated = await store.updateMeta(d.meta.id, { folderId });
+    await recheck();
+    res.json(await docView(updated!, d.role));
   }));
 
   api.delete('/docs/:id', asyncRoute(async (req, res) => {
-    const meta = await docFor(req, res, { ownerOnly: true });
-    if (!meta) return;
-    await kickUnauthorized(meta.id, null);
-    models.delete(meta.id);
-    await store.remove(meta.id);
+    const d = await docFor(req, res, 'owner');
+    if (!d) return;
+    for (const conn of hocuspocus.documents.get(d.meta.id)?.getConnections() ?? []) conn.close({ code: 4403, reason: 'Forbidden' });
+    models.delete(d.meta.id);
+    await store.remove(d.meta.id);
     res.status(204).end();
   }));
 
   api.get('/docs/:id/base', asyncRoute(async (req, res) => {
-    const meta = await docFor(req, res);
-    if (!meta) return;
-    const bytes = await store.base(meta.id);
+    const d = await docFor(req, res);
+    if (!d) return;
+    const bytes = await store.base(d.meta.id);
     if (!bytes) return notFound(res);
     res.set('Cache-Control', 'private, max-age=31536000, immutable');
     res.type('application/octet-stream').send(Buffer.from(bytes));
   }));
 
   api.get('/docs/:id/model', asyncRoute(async (req, res) => {
-    const meta = await docFor(req, res);
-    if (!meta) return;
-    const json = meta.kind === 'xlsx' ? await store.modelJson(meta.id) : null;
+    const d = await docFor(req, res);
+    if (!d) return;
+    const json = d.meta.kind === 'xlsx' ? await store.modelJson(d.meta.id) : null;
     if (!json) return notFound(res, 'XLSX 정보를');
     res.set('Cache-Control', 'private, max-age=31536000, immutable');
     res.type('application/json').send(json);
@@ -480,33 +446,109 @@ export async function createServer({
     res.type(MIME[kind]).send(Buffer.from(bytes));
   };
 
-  // 지금 상태를 파일로 내려받는다.
+  // 지금 상태를 파일로 내려받는다 (보기 권한도 가능).
   api.get('/docs/:id/export', asyncRoute(async (req, res) => {
-    const meta = await docFor(req, res);
-    if (!meta) return;
-    let ydoc: Y.Doc | undefined = hocuspocus.documents.get(meta.id);
+    const d = await docFor(req, res);
+    if (!d) return;
+    let ydoc: Y.Doc | undefined = hocuspocus.documents.get(d.meta.id);
     if (!ydoc) {
-      const update = await store.ydoc(meta.id);
+      const update = await store.ydoc(d.meta.id);
       if (!update) return notFound(res);
       ydoc = new Y.Doc();
       Y.applyUpdate(ydoc, update);
     }
-    const bytes = await persist(meta.id, ydoc);
+    const bytes = await persist(d.meta.id, ydoc);
     if (!bytes) {
       res.status(500).json({ error: '파일을 만들지 못했습니다.' });
       return;
     }
-    sendFile(res, meta.kind, meta.title, bytes);
+    sendFile(res, d.meta.kind, d.meta.title, bytes);
   }));
 
   api.get('/docs/:id/versions/:name', asyncRoute(async (req, res) => {
-    const meta = await docFor(req, res);
-    if (!meta) return;
+    const d = await docFor(req, res);
+    if (!d) return;
     const name = String(req.params.name);
-    const bytes = await store.version(meta.id, name);
+    const bytes = await store.version(d.meta.id, name);
     if (!bytes) return notFound(res, '저장본을');
-    sendFile(res, meta.kind, `${meta.title} ${name.replace(/\.(hwpx|xlsx)$/, '')}`, bytes);
+    sendFile(res, d.meta.kind, `${d.meta.title} ${name.replace(/\.(hwpx|xlsx)$/, '')}`, bytes);
   }));
+
+  // ── 업무 폴더 (최대 3단계) ──
+
+  // 내가 볼 수 있는 모든 폴더 (위 폴더 권한을 받으면 아래 폴더도 보인다)
+  api.get('/folders', asyncRoute(async (req, res) => {
+    const who = await whoOf(req);
+    const docs = await store.list();
+    const out: object[] = [];
+    for (const f of await folders.all()) {
+      const role = await access.folderRole(f.id, who);
+      if (role) out.push(await folderView(f, role, docs.filter((d) => d.folderId === f.id).length));
+    }
+    res.json(out);
+  }));
+
+  api.post('/folders', express.json(), asyncRoute(async (req, res) => {
+    const body = req.body as { name?: unknown; parentId?: unknown } | undefined;
+    let parentId: string | null = null;
+    if (body?.parentId) {
+      const p = await folders.get(String(body.parentId));
+      const role = p ? await access.folderRole(p.id, await whoOf(req)) : null;
+      if (!p || !role) return notFound(res, '상위 폴더를');
+      if (!atLeast(role, 'edit')) {
+        res.status(403).json({ error: '이 폴더 안에 폴더를 만들 권한이 없습니다(보기 권한).' });
+        return;
+      }
+      parentId = p.id;
+    }
+    const f = await folders.create(String(body?.name ?? ''), me(req).id, parentId);
+    res.status(201).json(await folderView(f, 'owner', 0));
+  }));
+
+  const docCount = async (fid: string): Promise<number> => (await store.list()).filter((d) => d.folderId === fid).length;
+
+  api.get('/folders/:fid', asyncRoute(async (req, res) => {
+    const f = await folderFor(req, res);
+    if (!f) return;
+    res.json(await folderView(f.folder, f.role, await docCount(f.folder.id)));
+  }));
+
+  api.patch('/folders/:fid', express.json(), asyncRoute(async (req, res) => {
+    const f = await folderFor(req, res, 'owner');
+    if (!f) return;
+    const body = req.body as { name?: unknown } | undefined;
+    const updated = await folders.update(f.folder.id, { name: String(body?.name ?? '') });
+    res.json(await folderView(updated, f.role, await docCount(f.folder.id)));
+  }));
+
+  // 폴더 권한: 사람·부서별 편집/보기 권한 목록을 통째로 정한다. 아래 폴더와 문서에도 그대로 간다.
+  api.put('/folders/:fid/grants', express.json(), asyncRoute(async (req, res) => {
+    const f = await folderFor(req, res, 'owner');
+    if (!f) return;
+    const grants = await access.cleanGrants((req.body as { grants?: unknown } | undefined)?.grants, [f.folder.owner]);
+    const updated = await folders.update(f.folder.id, { grants });
+    await recheck();
+    res.json(await folderView(updated, f.role, await docCount(f.folder.id)));
+  }));
+
+  // 폴더 지우기: 하위 폴더도 함께 지우고, 안의 문서는 지운 폴더의 상위 폴더(맨 위면 폴더 밖)로 옮긴다.
+  api.delete('/folders/:fid', asyncRoute(async (req, res) => {
+    const f = await folderFor(req, res, 'owner');
+    if (!f) return;
+    const gone = await folders.removeTree(f.folder.id);
+    for (const m of await store.list()) {
+      if (m.folderId && gone.has(m.folderId)) await store.updateMeta(m.id, { folderId: f.folder.parentId });
+    }
+    await recheck();
+    res.status(204).end();
+  }));
+
+  // ── 조직도 (누구나 볼 수 있음, 고치기는 관리자) ──
+  api.get('/org', asyncRoute(async (req, res) => {
+    res.json(await org.list());
+  }));
+
+  api.use('/admin', adminRouter({ users, org, folders, store, recheck }));
 
   app.use('/api', api);
   app.use('/api', (req, res) => {
@@ -538,13 +580,16 @@ export async function createServer({
     debounce,
     maxDebounce,
 
-    // 로그인 쿠키로 사람을 확인하고, 그 문서의 편집 권한이 있는지 본다.
-    async onAuthenticate({ documentName, requestHeaders }): Promise<ConnContext> {
+    // 로그인 쿠키로 사람을 확인하고 그 문서의 권한을 본다. 보기 권한이면 읽기 전용으로 연다.
+    async onAuthenticate({ documentName, requestHeaders, connectionConfig }): Promise<ConnContext> {
       if (!sameOrigin(requestHeaders.get('origin'), requestHeaders.get('host'))) throw new Error('Forbidden');
       const user = await users.userForToken(parseCookies(requestHeaders.get('cookie'))[COOKIE]);
       const meta = user && Store.isId(documentName) ? await store.meta(documentName) : null;
-      if (!user || !meta || !(await canAccess(meta, user.id))) throw new Error('Forbidden');
-      return { userId: user.id };
+      const role = user && meta ? await access.docRole(meta, await access.who(user)) : null;
+      if (!user || !role) throw new Error('Forbidden');
+      const readOnly = role === 'view';
+      connectionConfig.readOnly = readOnly;
+      return { userId: user.id, readOnly };
     },
 
     async onLoadDocument({ documentName, document }) {
@@ -574,6 +619,8 @@ export async function createServer({
     store,
     users,
     folders,
+    org,
+    access,
     async listen(port = Number(process.env.PORT) || 8787, host = process.env.HOST || '0.0.0.0') {
       server.configuration.address = host;
       // listen(0) 은 0 을 무시하므로 설정에 직접 넣는다 (0 = 빈 포트 자동 선택).
@@ -593,7 +640,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const port = await srv.listen();
   console.log(`동시편집 서버: http://localhost:${port}`);
   if ((await srv.users.count()) === 0) {
-    console.log('아직 계정이 없습니다. 화면에서 가입하거나 `node scripts/users.ts add <아이디> <이름> <암호>` 로 만드세요.');
+    console.log('아직 계정이 없습니다. 화면에서 가입하면 첫 계정이 관리자가 됩니다. 또는 `node scripts/users.ts add <아이디> <이름> <암호> --admin`');
   }
   const stop = async (): Promise<void> => {
     await srv.close();

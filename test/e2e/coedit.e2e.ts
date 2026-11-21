@@ -135,8 +135,8 @@ async function upload(page: Page, name: string, bytes: Uint8Array): Promise<stri
 /** 공유 창에서 사람을 찾아 편집 권한을 준다. */
 async function share(page: Page, who: string): Promise<void> {
   await page.getByRole('button', { name: '공유', exact: true }).click();
-  await page.getByLabel('사람 찾기').fill(who);
-  await page.getByRole('button', { name: '편집 권한 주기' }).first().click();
+  await page.getByLabel('사람이나 부서 찾기').fill(who);
+  await page.getByRole('button', { name: '추가', exact: true }).first().click();
   await page.waitForSelector(`dialog.share .members >> text=${who}`);
   await page.getByRole('button', { name: '닫기' }).click();
 }
@@ -293,14 +293,12 @@ try {
   assert.equal(saved.sheets[0]!.cells.D6?.v, 9250000);
 
   // ── 3) 권한 거두기: 열어 둔 화면이 막힌다 ──
-  await srv.store.updateMeta(xlsxId, { editors: [] });
-  const res = await fetch(`${origin}/api/docs/${xlsxId}/editors`, { method: 'PUT' });
+  const res = await fetch(`${origin}/api/docs/${xlsxId}/shares`, { method: 'PUT' });
   assert.equal(res.status, 401, '로그인하지 않은 요청은 거절');
   // 화면의 공유 창으로 권한을 뺀다.
-  await srv.store.updateMeta(xlsxId, { editors: [ids.narae!] });
   await garam.getByRole('button', { name: '공유', exact: true }).click();
-  await garam.getByRole('button', { name: '권한 빼기' }).click();
-  await garam.waitForSelector('dialog.share >> text=아직 함께 편집하는 사람이 없습니다.');
+  await garam.getByRole('button', { name: '빼기', exact: true }).click();
+  await garam.waitForSelector('dialog.share >> text=아직 권한을 받은 사람이나 부서가 없습니다.');
   await garam.getByRole('button', { name: '닫기' }).click();
   await narae.waitForSelector('.blocker', { timeout: 5000 });
 
@@ -328,10 +326,10 @@ try {
   const folderId = garam.url().split('/').pop()!;
   await garam.waitForSelector('.folder-head >> text=2027 예산 편성');
 
-  // 구성원 추가
-  await garam.getByRole('button', { name: '구성원 관리' }).click();
-  await garam.getByLabel('사람 찾기').fill('다온');
-  await garam.getByRole('button', { name: '구성원으로 추가' }).click();
+  // 폴더 권한: 다온에게 편집
+  await garam.getByRole('button', { name: '권한 관리' }).click();
+  await garam.getByLabel('사람이나 부서 찾기').fill('다온');
+  await garam.getByRole('button', { name: '추가', exact: true }).click();
   await garam.waitForSelector('dialog.share .members >> text=박다온');
   await garam.getByRole('button', { name: '닫기' }).click();
 
@@ -367,18 +365,63 @@ try {
     await garam.screenshot({ path: path.join(shots, '1-home.png') });
   }
 
-  // 구성원에서 빼면 열어 둔 화면이 막힌다.
-  await srv.folders.update(folderId, { members: [] });
+  // ── 5) 관리자: 조직도를 만들고 다온을 부서에 넣는다 ──
+  await garam.goto(`${origin}/#/admin`);
+  await garam.waitForSelector('.org-list');
+  garam.once('dialog', (d) => void d.accept('기획조정실'));
+  await garam.getByRole('button', { name: '+ 최상위 부서' }).click();
+  await garam.waitForSelector('.org-list >> text=기획조정실');
+  garam.once('dialog', (d) => void d.accept('정보화담당관'));
+  await garam.getByRole('button', { name: '+ 하위 부서' }).click();
+  await garam.waitForSelector('.org-list >> text=정보화담당관');
+  await garam.getByLabel('박다온 부서').selectOption({ label: '　정보화담당관' });
+  await waitFor(async () => (await srv.users.get(ids.daon!))?.deptId !== null, '부서 지정');
+  await garam.getByLabel('박다온 직위').fill('주무관');
+  await garam.keyboard.press('Tab');
+  await waitFor(async () => (await srv.users.get(ids.daon!))?.title === '주무관', '직위 지정');
+  if (shots) await garam.screenshot({ path: path.join(shots, '6-admin.png') });
+
+  // ── 6) 폴더 권한을 사람 대신 부서(보기)로 → 다온은 보기 전용으로 열린다 ──
   await garam.goto(`${origin}/#/f/${folderId}`);
   await garam.waitForSelector('.folder-head');
-  await garam.getByRole('button', { name: '구성원 관리' }).click();
-  await garam.waitForSelector('dialog.share >> text=아직 구성원이 없습니다.');
-  await garam.getByLabel('사람 찾기').fill('다온');
-  await garam.getByRole('button', { name: '구성원으로 추가' }).click();
-  await garam.waitForSelector('dialog.share .members >> text=박다온');
+  await garam.getByRole('button', { name: '권한 관리' }).click();
   await garam.getByRole('button', { name: '빼기', exact: true }).click();
-  await garam.waitForSelector('dialog.share >> text=아직 구성원이 없습니다.');
+  await garam.waitForSelector('dialog.share >> text=아직 권한을 받은 사람이나 부서가 없습니다.');
   await daon.waitForSelector('.blocker', { timeout: 5000 });
+  await garam.getByLabel('줄 권한').selectOption({ label: '보기' });
+  await garam.getByLabel('사람이나 부서 찾기').fill('기획조정');
+  await garam.getByRole('button', { name: '추가', exact: true }).click();
+  await garam.waitForSelector('dialog.share .members >> text=기획조정실');
+  await garam.getByRole('button', { name: '닫기' }).click();
+
+  await daon.goto(`${origin}/#/d/${hwpxId}`);
+  await daon.reload();
+  await daon.waitForFunction(() => window.__editor);
+  await daon.waitForSelector('.toolbar .ro');
+  const before = await bodyTexts(daon);
+  await clickText(daon, 0, 0);
+  await daon.keyboard.type('몰래');
+  await daon.waitForTimeout(300);
+  assert.deepEqual(await bodyTexts(daon), before, '보기 전용에서는 고쳐지지 않는다');
+
+  // ── 7) 하위 폴더 (3단계까지) ──
+  garam.once('dialog', (d) => void d.accept('정보화 예산'));
+  await garam.getByRole('button', { name: '+ 하위 폴더' }).click();
+  await garam.waitForSelector('.folder-head >> text=정보화 예산');
+  garam.once('dialog', (d) => void d.accept('서버 도입'));
+  await garam.getByRole('button', { name: '+ 하위 폴더' }).click();
+  await garam.waitForSelector('.folder-head >> text=서버 도입');
+  assert.equal(await garam.getByRole('button', { name: '+ 하위 폴더' }).count(), 0, '3단계에서는 더 만들 수 없다');
+  assert.equal(await garam.locator('.crumbs a').count(), 2, '경로 표시');
+  if (shots) {
+    await garam.getByRole('button', { name: '빈 엑셀 문서' }).click();
+    await garam.waitForURL(/#\/d\//);
+    await garam.waitForFunction(() => window.__grid);
+    await garam.locator('.tool.back').click();
+    await garam.waitForSelector('.doc-list li .doc-title');
+    await garam.screenshot({ path: path.join(shots, '7-tree.png') });
+    await daon.screenshot({ path: path.join(shots, '8-readonly.png') });
+  }
 
   assert.equal(failed, false, '페이지 오류가 없어야 한다');
   console.log('✓ 동시편집 e2e 시험 통과');

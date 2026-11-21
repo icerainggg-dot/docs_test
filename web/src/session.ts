@@ -1,14 +1,14 @@
 // 로그인한 사람
 
-import type { Person } from './api.ts';
+import type { Me } from './api.ts';
 
-let current: Person | null = null;
+let current: Me | null = null;
 
 export const session = {
-  get user(): Person | null {
+  get user(): Me | null {
     return current;
   },
-  set(user: Person | null): void {
+  set(user: Me | null): void {
     current = user;
   },
 };

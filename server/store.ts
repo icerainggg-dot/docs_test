@@ -9,6 +9,7 @@
 import { mkdir, readFile, writeFile, readdir, rm, rename, stat } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
+import type { Grant } from './access.ts';
 
 const ID_RE = /^[a-z0-9]{12}$/;
 const VERSION_RE = /^\d{8}T\d{6}Z\.(hwpx|xlsx)$/;
@@ -32,8 +33,8 @@ export interface DocMeta {
   title: string;
   /** 올린 사람 (권한을 줄 수 있는 사람) */
   owner: string;
-  /** 동시편집 권한을 받은 사람들 */
-  editors: string[];
+  /** 이 문서에 사람·부서별로 준 편집/보기 권한 */
+  shares: Grant[];
   /** 들어 있는 업무 폴더 (없으면 null) */
   folderId: string | null;
   filename: string;
@@ -92,7 +93,7 @@ export class Store {
       kind: input.kind,
       title: input.title,
       owner: input.owner,
-      editors: [],
+      shares: [],
       folderId: input.folderId ?? null,
       filename: input.filename,
       createdAt: now,
@@ -108,10 +109,12 @@ export class Store {
 
   async meta(id: string): Promise<DocMeta | null> {
     try {
-      const meta = JSON.parse(await readFile(path.join(this.dir(id), 'meta.json'), 'utf8')) as DocMeta;
-      meta.kind ??= 'hwpx'; // 예전 판에서 만든 문서
-      meta.editors ??= [];
+      const meta = JSON.parse(await readFile(path.join(this.dir(id), 'meta.json'), 'utf8')) as DocMeta & { editors?: string[] };
+      // 예전 판에서 만든 문서
+      meta.kind ??= 'hwpx';
       meta.folderId ??= null;
+      if (!meta.shares) meta.shares = (meta.editors ?? []).map((u) => ({ type: 'user' as const, id: u, role: 'edit' as const }));
+      delete meta.editors;
       return meta;
     } catch {
       return null;

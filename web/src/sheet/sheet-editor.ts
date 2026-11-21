@@ -58,6 +58,8 @@ export class SheetEditor {
   readonly undoManager: Y.UndoManager;
   readonly awareness: AwarenessLike;
   sheet: number;
+  /** 보기 권한: 고칠 수 없다 (서버도 편집을 받지 않는다) */
+  readOnly = false;
   /** 시트마다 화면에 보이는 칸 수 (아래·오른쪽으로 넓어진다) */
   readonly extent: { rows: number; cols: number }[];
   private readonly selections: SheetSelection[];
@@ -160,7 +162,7 @@ export class SheetEditor {
 
   /** 여러 셀을 한 번에 (실행 취소도 한 번에) */
   setMany(si: number, entries: [string, CellInput][]): void {
-    if (!entries.length) return;
+    if (!entries.length || this.readOnly) return;
     this.undoManager.stopCapturing();
     this.ydoc.transact(() => {
       for (const [addr, input] of entries) {
@@ -229,10 +231,12 @@ export class SheetEditor {
   }
 
   undo(): void {
+    if (this.readOnly) return;
     this.undoManager.undo();
   }
 
   redo(): void {
+    if (this.readOnly) return;
     this.undoManager.redo();
   }
 

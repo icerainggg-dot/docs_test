@@ -7,7 +7,7 @@ import { initRhwp, HwpDocument } from './rhwp.ts';
 import { Editor } from './editor/editor.ts';
 import { View } from './editor/view.ts';
 import { bindInput } from './editor/input.ts';
-import { connectCollab, denyOverlay, flasher, titleField, shareButton, peerAvatars, statusWidgets } from './shell.ts';
+import { connectCollab, denyOverlay, flasher, titleField, shareButton, peerAvatars, statusWidgets, readOnlyBadge } from './shell.ts';
 
 declare global {
   interface Window {
@@ -58,6 +58,7 @@ export async function showDoc(root: HTMLElement, meta: DocInfo): Promise<() => v
     return cleanup;
   }
   const ed = editor;
+  ed.readOnly = meta.role === 'view';
   cleanups.push(() => ed.destroy());
   window.__editor = ed;
 
@@ -107,6 +108,7 @@ export async function showDoc(root: HTMLElement, meta: DocInfo): Promise<() => v
     { class: 'toolbar' },
     h('a', { href: meta.folderId ? `#/f/${meta.folderId}` : '#/', class: 'tool back', title: meta.folder ? `${meta.folder.name} 폴더로` : '문서 목록', 'aria-label': '문서 목록' }, '←'),
     titleField(meta, flash, SUFFIX),
+    readOnlyBadge(meta),
     h('span', { class: 'sep' }),
     tool('↶', '실행 취소 (Ctrl+Z)', () => ed.undo()),
     tool('↷', '다시 실행 (Ctrl+Y)', () => ed.redo()),
@@ -127,6 +129,10 @@ export async function showDoc(root: HTMLElement, meta: DocInfo): Promise<() => v
     shareButton(meta),
     h('a', { class: 'btn primary small', href: api.exportUrl(id), download: '' }, 'HWPX 받기'),
   );
+
+  if (ed.readOnly) {
+    for (const el of toolbar.querySelectorAll<HTMLButtonElement | HTMLInputElement>('.tool[data-attr], .tool.color, .tool[title^="실행"], .tool[title^="다시"]')) el.disabled = true;
+  }
 
   message.remove();
   const shell = h('div', { class: 'doc' }, toolbar, scroller, flashEl);
