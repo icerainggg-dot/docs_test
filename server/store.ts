@@ -1,8 +1,9 @@
 // 파일 기반 저장소.
-//   <DATA_DIR>/docs/<id>/meta.json     제목·시각·저장 상태
-//   <DATA_DIR>/docs/<id>/base.bin      올린 원본(HWP/HWPX) — 모든 참여자가 같은 원본에서 출발한다
+//   <DATA_DIR>/docs/<id>/meta.json     제목·종류·소유자·편집자·시각·저장 상태
+//   <DATA_DIR>/docs/<id>/base.bin      올린 원본(HWP/HWPX/XLSX) — 모든 참여자가 같은 원본에서 출발한다
+//   <DATA_DIR>/docs/<id>/model.json    XLSX 의 해석 결과 (화면 표시·계산용)
 //   <DATA_DIR>/docs/<id>/ydoc.bin      동시편집 상태(Yjs)
-//   <DATA_DIR>/docs/<id>/latest.hwpx   가장 최근 저장본
+//   <DATA_DIR>/docs/<id>/latest.<ext>  가장 최근 저장본
 //   <DATA_DIR>/docs/<id>/versions/     시점별 저장본
 
 import { mkdir, readFile, writeFile, readdir, rm, rename, stat } from 'node:fs/promises';
@@ -10,7 +11,9 @@ import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 
 const ID_RE = /^[a-z0-9]{12}$/;
-const VERSION_RE = /^\d{8}T\d{6}Z\.hwpx$/;
+const VERSION_RE = /^\d{8}T\d{6}Z\.(hwpx|xlsx)$/;
+
+export type DocKind = 'hwpx' | 'xlsx';
 
 /** 마지막 저장 결과 */
 export interface SaveStatus {
@@ -25,7 +28,12 @@ export interface SaveStatus {
 
 export interface DocMeta {
   id: string;
+  kind: DocKind;
   title: string;
+  /** 올린 사람 (권한을 줄 수 있는 사람) */
+  owner: string;
+  /** 동시편집 권한을 받은 사람들 */
+  editors: string[];
   filename: string;
   createdAt: string;
   updatedAt: string;
@@ -63,13 +71,32 @@ export class Store {
     await rename(tmp, file);
   }
 
-  async create(input: { title: string; filename: string; base: Uint8Array; ydocUpdate: Uint8Array }): Promise<DocMeta> {
+  async create(input: {
+    kind: DocKind;
+    title: string;
+    filename: string;
+    owner: string;
+    base: Uint8Array;
+    ydocUpdate: Uint8Array;
+    model?: unknown;
+  }): Promise<DocMeta> {
     const id = randomBytes(9).toString('base64url').toLowerCase().replace(/[^a-z0-9]/g, 'x').slice(0, 12);
     const dir = this.dir(id);
     await mkdir(path.join(dir, 'versions'), { recursive: true });
     const now = new Date().toISOString();
-    const meta: DocMeta = { id, title: input.title, filename: input.filename, createdAt: now, updatedAt: now, save: null };
+    const meta: DocMeta = {
+      id,
+      kind: input.kind,
+      title: input.title,
+      owner: input.owner,
+      editors: [],
+      filename: input.filename,
+      createdAt: now,
+      updatedAt: now,
+      save: null,
+    };
     await this.write(path.join(dir, 'base.bin'), input.base);
+    if (input.model !== undefined) await this.write(path.join(dir, 'model.json'), JSON.stringify(input.model));
     await this.write(path.join(dir, 'ydoc.bin'), input.ydocUpdate);
     await this.write(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 2));
     return meta;
@@ -77,7 +104,10 @@ export class Store {
 
   async meta(id: string): Promise<DocMeta | null> {
     try {
-      return JSON.parse(await readFile(path.join(this.dir(id), 'meta.json'), 'utf8')) as DocMeta;
+      const meta = JSON.parse(await readFile(path.join(this.dir(id), 'meta.json'), 'utf8')) as DocMeta;
+      meta.kind ??= 'hwpx'; // 예전 판에서 만든 문서
+      meta.editors ??= [];
+      return meta;
     } catch {
       return null;
     }
@@ -118,8 +148,13 @@ export class Store {
     return this.read(id, 'ydoc.bin');
   }
 
-  latest(id: string): Promise<Uint8Array | null> {
-    return this.read(id, 'latest.hwpx');
+  /** XLSX 해석 결과 (JSON 문자열 그대로) */
+  async modelJson(id: string): Promise<string | null> {
+    try {
+      return await readFile(path.join(this.dir(id), 'model.json'), 'utf8');
+    } catch {
+      return null;
+    }
   }
 
   async saveYdoc(id: string, update: Uint8Array): Promise<void> {
@@ -127,9 +162,9 @@ export class Store {
   }
 
   /** 저장본을 기록한다. 일정 간격마다 시점별 저장본도 남긴다. */
-  async saveHwpx(id: string, bytes: Uint8Array): Promise<void> {
+  async saveFile(id: string, kind: DocKind, bytes: Uint8Array): Promise<void> {
     const dir = this.dir(id);
-    await this.write(path.join(dir, 'latest.hwpx'), bytes);
+    await this.write(path.join(dir, `latest.${kind}`), bytes);
     const vdir = path.join(dir, 'versions');
     await mkdir(vdir, { recursive: true });
     const names = (await readdir(vdir)).filter((n) => VERSION_RE.test(n)).sort();
@@ -139,7 +174,7 @@ export class Store {
       if (age < this.versionIntervalMs) return;
     }
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
-    await this.write(path.join(vdir, `${stamp}.hwpx`), bytes);
+    await this.write(path.join(vdir, `${stamp}.${kind}`), bytes);
     for (const old of names.slice(0, Math.max(0, names.length + 1 - this.maxVersions))) {
       await rm(path.join(vdir, old), { force: true });
     }

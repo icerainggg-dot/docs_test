@@ -11,5 +11,5 @@
     "declarationDir": "node_modules/.cache/tsc/node",
     "tsBuildInfoFile": "node_modules/.cache/tsc/node.tsbuildinfo"
   },
-  "include": ["src/shared", "server", "test", "scripts", "web/src/editor/editor.ts"]
+  "include": ["src/shared", "server", "test", "scripts"]
 }

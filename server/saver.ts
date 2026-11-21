@@ -5,6 +5,10 @@ import type * as Y from 'yjs';
 import { openDocument } from '../src/shared/rhwp-node.ts';
 import { Reconciler } from '../src/shared/reconciler.ts';
 import type { Diff } from '../src/shared/reconciler.ts';
+import { patchXlsx, verifyXlsx } from '../src/shared/xlsx/write.ts';
+import type { XlsxDiff } from '../src/shared/xlsx/write.ts';
+import { editsFromYDoc } from '../src/shared/xlsx/sheetdoc.ts';
+import type { WorkbookModel } from '../src/shared/xlsx/types.ts';
 
 export type SaveIssue = Diff | { warning: string } | (Diff & { stage: 'reopen' }) | { stage: 'reopen'; error: string };
 
@@ -41,4 +45,15 @@ export function renderHwpx(baseBytes: Uint8Array, ydoc: Y.Doc): RenderResult {
     diffs.push({ stage: 'reopen', error: String(e) });
   }
   return { bytes, diffs };
+}
+
+/** XLSX 저장: 원본 + 고친 셀 → XLSX, 그리고 다시 읽어 고친 셀이 들어 있는지 검사 */
+export function renderXlsx(baseBytes: Uint8Array, model: WorkbookModel, ydoc: Y.Doc): { bytes: Uint8Array; diffs: (XlsxDiff | { stage: 'reopen'; error: string })[] } {
+  const edits = editsFromYDoc(ydoc, model.sheets.length);
+  const bytes = patchXlsx(baseBytes, model, edits);
+  try {
+    return { bytes, diffs: verifyXlsx(bytes, edits) };
+  } catch (e) {
+    return { bytes, diffs: [{ stage: 'reopen', error: String(e) }] };
+  }
 }

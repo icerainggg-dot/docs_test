@@ -29,7 +29,7 @@ export class WebDav {
     const target = `${this.url}/${encodeURIComponent(this.fileName(meta))}`;
     const headers: Record<string, string> = { 'Content-Type': 'application/hwp+zip' };
     if (this.auth) headers.Authorization = this.auth;
-    const res = await fetch(target, { method: 'PUT', headers, body: bytes });
+    const res = await fetch(target, { method: 'PUT', headers, body: Buffer.from(bytes) });
     if (!res.ok) throw new Error(`WebDAV 저장 실패: HTTP ${res.status}`);
     return target;
   }

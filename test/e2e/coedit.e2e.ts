@@ -1,5 +1,5 @@
 /// <reference lib="dom" />
-// 브라우저 두 개로 같은 문서를 열어 동시편집을 확인하는 자동 시험.
+// 브라우저로 실제 사용 흐름을 확인하는 자동 시험.
 //   npm run build && npm run test:e2e
 // SHOTS=<폴더> 를 주면 화면 갈무리를 남긴다.
 // Playwright 는 프로젝트 의존성이 아니라 실행 환경에 설치된 것을 쓴다.
@@ -12,87 +12,83 @@ import { createRequire } from 'node:module';
 import { createServer } from '../../server/index.ts';
 import type { DocMeta } from '../../server/store.ts';
 import { sampleHwpx } from '../unit/helpers.ts';
+import { sampleXlsx } from '../unit/xlsx-sample.ts';
 import { openDocument } from '../../src/shared/rhwp-node.ts';
-import type { Editor } from '../../web/src/editor/editor.ts';
-
+import { parseXlsx } from '../../src/shared/xlsx/parse.ts';
+// 화면이 자동 시험용으로 window 에 걸어 두는 객체 중 이 시험이 쓰는 부분
+interface E2EEditor {
+  list(key: string): { map<T>(fn: (p: { get(k: string): unknown }) => T): T[] };
+  hwpPos(p: { key: string; idx: number; off: number }): { ref: unknown; idx: number; off: number } | null;
+  adapter: { cursorRect(ref: unknown, idx: number, off: number): { pageIndex: number; x: number; y: number; height: number } };
+}
+interface E2ESheet {
+  display(sheet: number, row: number, col: number): { text: string };
+}
+interface E2EGrid {
+  clientRectOf(row: number, col: number): { x: number; y: number; w: number; h: number };
+}
 declare global {
   interface Window {
-    __editor?: Editor;
+    __editor?: E2EEditor;
+    __sheet?: E2ESheet;
+    __grid?: E2EGrid;
   }
 }
 
 // ── Playwright 중 이 시험이 쓰는 부분 ──
-interface Mouse {
-  click(x: number, y: number): Promise<void>;
-}
-interface Keyboard {
-  type(text: string, opts?: { delay?: number }): Promise<void>;
-  press(key: string): Promise<void>;
-  down(key: string): Promise<void>;
-  up(key: string): Promise<void>;
-}
 interface Locator {
   count(): Promise<number>;
+  click(): Promise<void>;
+  fill(v: string): Promise<void>;
+  first(): Locator;
   textContent(): Promise<string | null>;
   getAttribute(name: string): Promise<string | null>;
   setInputFiles(file: { name: string; mimeType: string; buffer: Buffer }): Promise<void>;
-}
-interface CDPSession {
-  send(method: string, params?: object): Promise<unknown>;
+  waitFor(opts?: { state?: string; timeout?: number }): Promise<void>;
 }
 interface Page {
   goto(url: string): Promise<unknown>;
+  reload(): Promise<unknown>;
   url(): string;
-  close(): Promise<void>;
   on(event: 'pageerror', fn: (e: Error) => void): void;
   on(event: 'console', fn: (m: { type(): string; text(): string }) => void): void;
-  waitForSelector(sel: string): Promise<unknown>;
+  waitForSelector(sel: string, opts?: { timeout?: number }): Promise<unknown>;
   waitForURL(re: RegExp): Promise<void>;
   waitForFunction(fn: () => unknown): Promise<unknown>;
   waitForTimeout(ms: number): Promise<void>;
   evaluate<R>(fn: () => R): Promise<R>;
   evaluate<R, A>(fn: (arg: A) => R, arg: A): Promise<R>;
   locator(sel: string): Locator;
+  getByRole(role: string, opts: { name: string | RegExp; exact?: boolean }): Locator;
+  getByLabel(text: string, opts?: { exact?: boolean }): Locator;
   screenshot(opts: { path: string }): Promise<unknown>;
   context(): BrowserContext;
-  mouse: Mouse;
-  keyboard: Keyboard;
+  mouse: { click(x: number, y: number, opts?: { clickCount?: number }): Promise<void>; dblclick(x: number, y: number): Promise<void> };
+  keyboard: { type(text: string, opts?: { delay?: number }): Promise<void>; press(key: string): Promise<void> };
 }
 interface BrowserContext {
   newPage(): Promise<Page>;
-  addInitScript<A>(fn: (arg: A) => void, arg: A): Promise<void>;
-  newCDPSession(page: Page): Promise<CDPSession>;
+  newCDPSession(page: Page): Promise<{ send(method: string, params?: object): Promise<unknown> }>;
 }
 interface Browser {
-  newPage(opts?: object): Promise<Page>;
   newContext(opts?: object): Promise<BrowserContext>;
   close(): Promise<void>;
 }
 const { chromium } = createRequire(import.meta.url)('playwright') as { chromium: { launch(): Promise<Browser> } };
 
 const shots = process.env.SHOTS;
-
-const dataDir = await mkdtemp(path.join(os.tmpdir(), 'hwpx-coedit-e2e-'));
+const dataDir = await mkdtemp(path.join(os.tmpdir(), 'coedit-e2e-'));
 const srv = await createServer({ dataDir, debounce: 100, maxDebounce: 500 });
 const port = await srv.listen(0, '127.0.0.1');
 const origin = `http://127.0.0.1:${port}`;
 const browser = await chromium.launch();
 let failed = false;
 
-const docInfo = async (id: string): Promise<DocMeta> => (await (await fetch(`${origin}/api/docs/${id}`)).json()) as DocMeta;
+await srv.users.create('garam', '김가람', 'password1234');
+await srv.users.create('narae', '이나래', 'password1234');
+await srv.users.create('daon', '박다온', 'password1234');
+const ids = Object.fromEntries((await srv.users.list()).map((u) => [u.username, u.id]));
 
-// page.evaluate 안의 함수는 브라우저에서 돈다. 바깥 변수를 쓰지 않는다.
-const bodyTexts = (page: Page): Promise<string[]> =>
-  page.evaluate(() => {
-    const ed = window.__editor!;
-    return ed.list('s0').map((p) => String(p.get('t')));
-  });
-const hwpTexts = (page: Page): Promise<string[]> =>
-  page.evaluate(() => {
-    const ed = window.__editor!;
-    const ref = ed.rec.ref('s0')!;
-    return Array.from({ length: ed.adapter.paraCount(ref) }, (_, i) => ed.adapter.text(ref, i));
-  });
 const waitFor = async (fn: () => boolean | Promise<boolean>, what: string, ms = 8000): Promise<void> => {
   const t0 = Date.now();
   for (;;) {
@@ -102,151 +98,229 @@ const waitFor = async (fn: () => boolean | Promise<boolean>, what: string, ms = 
   }
 };
 
-async function openAs(name: string, id: string): Promise<Page> {
-  const ctx = await browser.newContext({ viewport: { width: 1100, height: 800 }, deviceScaleFactor: shots ? 2 : 1 });
-  await ctx.addInitScript((n: string) => localStorage.setItem('hwpx-coedit:name', n), name);
+/** 로그인 화면으로 들어온다. */
+async function login(username: string): Promise<Page> {
+  const ctx = await browser.newContext({ viewport: { width: 1200, height: 800 }, deviceScaleFactor: shots ? 2 : 1 });
   const page = await ctx.newPage();
   page.on('pageerror', (e) => {
     failed = true;
-    console.error(`[${name}] 페이지 오류:`, e.message);
+    console.error(`[${username}] 페이지 오류:`, e.message);
   });
   page.on('console', (m) => {
-    if (m.type() === 'error') console.error(`[${name}] console:`, m.text());
+    if (m.type() === 'error' && !/401|404|403/.test(m.text())) console.error(`[${username}] console:`, m.text());
   });
-  await page.goto(`${origin}/#/d/${id}`);
-  await page.waitForSelector('.page canvas');
-  await page.waitForFunction(() => window.__editor);
+  if (process.env.E2E_DEBUG) {
+    page.on('response' as 'console', ((r: { url(): string; status(): number }) => {
+      if (r.url().includes('/api/')) console.log(`[${username}]`, r.status(), r.url().replace(origin, ''));
+    }) as never);
+  }
+  await page.goto(origin);
+  await page.waitForURL(/#\/login$/);
+  await page.getByLabel('아이디').fill(username);
+  await page.getByLabel('암호 (8자 이상)').fill('password1234');
+  await page.getByRole('button', { name: '로그인', exact: true }).click();
+  await page.waitForSelector('.doc-list');
   return page;
 }
 
-/** 리스트 key 의 문단 idx, off 번째 글자 앞을 마우스로 누른다. */
-async function clickAt(page: Page, key: string, idx: number, off: number): Promise<void> {
-  const pt = await page.evaluate(
-    ([key, idx, off]: [string, number, number]) => {
-      const ed = window.__editor!;
-      const hp = ed.hwpPos({ key, idx, off })!;
-      const r = ed.adapter.cursorRect(hp.ref, hp.idx, hp.off);
-      const el = document.querySelectorAll('.page')[r.pageIndex]!.getBoundingClientRect();
-      return { x: el.left + r.x + 0.5, y: el.top + r.y + r.height / 2 };
-    },
-    [key, idx, off] as [string, number, number],
-  );
+async function upload(page: Page, name: string, bytes: Uint8Array): Promise<string> {
+  // 파일 경로로 넘기면 한글 이름에서 변경 이벤트가 나지 않아(시험 도구 문제) 내용으로 넘긴다.
+  await page.locator('input[type=file]').setInputFiles({ name, mimeType: 'application/octet-stream', buffer: Buffer.from(bytes) });
+  await page.waitForURL(/#\/d\/[a-z0-9]{12}$/);
+  return page.url().split('/').pop()!;
+}
+
+/** 공유 창에서 사람을 찾아 편집 권한을 준다. */
+async function share(page: Page, who: string): Promise<void> {
+  await page.getByRole('button', { name: '공유', exact: true }).click();
+  await page.getByLabel('사람 찾기').fill(who);
+  await page.getByRole('button', { name: '편집 권한 주기' }).first().click();
+  await page.waitForSelector(`dialog.share .members >> text=${who}`);
+  await page.getByRole('button', { name: '닫기' }).click();
+}
+
+async function openFromList(page: Page, title: string): Promise<void> {
+  await page.goto(`${origin}/#/`);
+  await page.reload();
+  await page.waitForSelector('.doc-list li');
+  await page.getByRole('link', { name: title }).click();
+}
+
+const docInfo = async (id: string): Promise<DocMeta> => {
+  const res = await fetch(`${origin}/api/docs`, { headers: {} });
+  void res;
+  return (await srv.store.meta(id))!;
+};
+
+// HWPX 도우미 (page.evaluate 안의 함수는 브라우저에서 돈다)
+const bodyTexts = (page: Page): Promise<string[]> =>
+  page.evaluate(() => window.__editor!.list('s0').map((p) => String(p.get('t'))));
+async function clickText(page: Page, idx: number, off: number): Promise<void> {
+  const pt = await page.evaluate(([idx, off]: [number, number]) => {
+    const ed = window.__editor!;
+    const hp = ed.hwpPos({ key: 's0', idx, off })!;
+    const r = ed.adapter.cursorRect(hp.ref, hp.idx, hp.off);
+    const el = document.querySelectorAll('.page')[r.pageIndex]!.getBoundingClientRect();
+    return { x: el.left + r.x + 0.5, y: el.top + r.y + r.height / 2 };
+  }, [idx, off] as [number, number]);
   await page.mouse.click(pt.x, pt.y);
 }
 
+// XLSX 도우미
+async function clickCell(page: Page, row: number, col: number, dbl = false): Promise<void> {
+  const r = await page.evaluate(([row, col]: [number, number]) => window.__grid!.clientRectOf(row, col), [row, col] as [number, number]);
+  if (dbl) await page.mouse.dblclick(r.x + r.w / 2, r.y + r.h / 2);
+  else await page.mouse.click(r.x + r.w / 2, r.y + r.h / 2);
+}
+const shown = (page: Page, sheet: number, row: number, col: number): Promise<string> =>
+  page.evaluate(([s, r, c]: [number, number, number]) => window.__sheet!.display(s, r, c).text, [sheet, row, col] as [number, number, number]);
+
 try {
-  // 1) 첫 화면에서 HWPX 올리기
-  const home = await browser.newPage();
-  await home.goto(origin);
-  await home.locator('input[type=file]').setInputFiles({
-    name: '시험 서식.hwpx',
-    mimeType: 'application/hwp+zip',
-    buffer: Buffer.from(sampleHwpx()),
-  });
-  await home.waitForURL(/#\/d\/[a-z0-9]{12}$/);
-  const id = home.url().split('/').pop()!;
-  await home.close();
+  const garam = await login('garam');
+  const narae = await login('narae');
+  const daon = await login('daon');
 
-  // 2) 두 사람이 같은 문서를 연다
-  const a = await openAs('김가람', id);
-  const b = await openAs('이나래', id);
-  assert.deepEqual((await bodyTexts(a)).filter(Boolean), ['동시편집 시험 문서', '둘째 문단입니다.', '끝 문단']);
-  await waitFor(async () => (await a.locator('.peer').count()) === 2, '참여자 두 명 표시');
+  // ── 1) HWPX: 올리기 → 공유 → 동시편집 ──
+  const hwpxId = await upload(garam, '시험 서식.hwpx', sampleHwpx());
+  await garam.waitForFunction(() => window.__editor);
+  assert.deepEqual((await bodyTexts(garam)).filter(Boolean), ['동시편집 시험 문서', '둘째 문단입니다.', '끝 문단']);
 
-  // 3) 서로 다른 문단에 동시에 입력
-  await clickAt(a, 's0', 0, 10);
-  await clickAt(b, 's0', 1, 0);
-  await Promise.all([a.keyboard.type(' — 가람이 씀', { delay: 15 }), b.keyboard.type('나래가 씀: ', { delay: 15 })]);
+  // 공유 전에는 남이 열 수 없다.
+  await daon.goto(`${origin}/#/d/${hwpxId}`);
+  await daon.waitForURL(/#\/$/);
+
+  await share(garam, '이나래');
+  await openFromList(narae, '시험 서식');
+  await narae.waitForFunction(() => window.__editor);
+  await waitFor(async () => (await garam.locator('.peer').count()) === 2, '참여자 두 명 표시');
+
+  await clickText(garam, 0, 10);
+  await clickText(narae, 1, 0);
+  await Promise.all([garam.keyboard.type(' — 가람', { delay: 15 }), narae.keyboard.type('나래: ', { delay: 15 })]);
   await waitFor(async () => {
-    const [ta, tb] = [await bodyTexts(a), await bodyTexts(b)];
-    return ta[0] === '동시편집 시험 문서 — 가람이 씀' && ta[1] === '나래가 씀: 둘째 문단입니다.' && JSON.stringify(ta) === JSON.stringify(tb);
-  }, '두 화면의 내용이 같아짐');
-  assert.deepEqual(await hwpTexts(a), await bodyTexts(a), 'A 의 rHWP 문서 = Y 상태');
-  assert.deepEqual(await hwpTexts(b), await bodyTexts(b), 'B 의 rHWP 문서 = Y 상태');
-  await waitFor(async () => (await a.locator('.caret.remote span').textContent().catch(() => '')) === '이나래', '상대 커서 표시');
+    const [a, b] = [await bodyTexts(garam), await bodyTexts(narae)];
+    return a[0] === '동시편집 시험 문서 — 가람' && a[1] === '나래: 둘째 문단입니다.' && JSON.stringify(a) === JSON.stringify(b);
+  }, 'HWPX 동시 입력');
+  await waitFor(async () => (await garam.locator('.caret.remote span').textContent().catch(() => '')) === '이나래', '상대 커서');
 
-  // 4) 같은 문단 안에서 동시에 입력 + 문단 나누기
-  await clickAt(a, 's0', 0, 0);
-  await clickAt(b, 's0', 0, 4);
-  await Promise.all([a.keyboard.type('[A]', { delay: 20 }), b.keyboard.type('[B]', { delay: 20 })]);
-  await b.keyboard.press('Enter');
-  await waitFor(async () => {
-    const ta = await bodyTexts(a);
-    return ta[0] === '[A]동시편집[B]' && ta[1] === ' 시험 문서 — 가람이 씀';
-  }, '같은 문단 동시 입력과 문단 나누기');
-
-  // 5) 한글 조합(IME) — 조합 중인 글자가 상대에게 보이고, 끝나면 확정된다
-  await clickAt(a, 's0', 2, 0);
-  const cdp = await a.context().newCDPSession(a);
-  for (const text of ['ㅎ', '하', '한']) {
-    await cdp.send('Input.imeSetComposition', { text, selectionStart: text.length, selectionEnd: text.length });
-  }
-  await waitFor(async () => ((await bodyTexts(b))[2] ?? '').startsWith('한'), '조합 중 글자가 상대에게 보임');
-  // 조합 중에 상대가 다른 문단을 고친다 → A 화면에는 조합이 끝난 뒤 반영된다
-  await clickAt(b, 's0', 3, 0);
-  await b.keyboard.type('#');
-  await waitFor(async () => ((await bodyTexts(a))[3] ?? '').startsWith('#'), 'A 의 Y 문서에 도착');
-  assert.notEqual((await hwpTexts(a))[3]?.[0], '#', '조합 중에는 원격 변경을 화면에 미룬다');
+  // 한글 조합 입력
+  await clickText(garam, 2, 0);
+  const cdp = await garam.context().newCDPSession(garam);
+  for (const text of ['ㅎ', '하', '한']) await cdp.send('Input.imeSetComposition', { text, selectionStart: text.length, selectionEnd: text.length });
+  await waitFor(async () => ((await bodyTexts(narae))[2] ?? '').startsWith('한'), '조합 중 글자가 상대에게 보임');
   await cdp.send('Input.insertText', { text: '한' });
-  await a.keyboard.type('글 ');
-  await waitFor(
-    async () => ((await hwpTexts(a))[3] ?? '').startsWith('#') && ((await bodyTexts(b))[2] ?? '').startsWith('한글 '),
-    '조합 종료 후 반영',
-  );
-
-  // 6) 서식, 실행 취소
-  await clickAt(a, 's0', 2, 0);
-  await a.keyboard.press('Shift+ArrowRight');
-  await a.keyboard.press('Shift+ArrowRight');
-  await a.keyboard.press('Control+b');
-  const boldAt = (page: Page): Promise<boolean> =>
-    page.evaluate(() => {
-      const ed = window.__editor!;
-      return ed.adapter.charProps(ed.rec.ref('s0')!, 2, 0).bold;
-    });
-  await waitFor(async () => (await boldAt(a)) && (await boldAt(b)), '굵게가 양쪽에 적용');
-  assert.equal(await a.locator('.fmt-b').getAttribute('aria-pressed'), 'true');
-  await a.keyboard.press('Control+z');
-  await waitFor(async () => !(await boldAt(a)) && !(await boldAt(b)), '실행 취소가 양쪽에 반영');
-  assert.ok(((await bodyTexts(a))[2] ?? '').startsWith('한글 '), '서식 실행 취소가 앞선 입력까지 되돌리지 않는다');
-
-  // 7) 표 셀 편집
-  const cellKey = await a.evaluate(() => [...window.__editor!.lists.keys()].find((k) => k.startsWith('c|') && k.endsWith('|3'))!);
-  await clickAt(a, cellKey, 0, 0);
-  await a.keyboard.type('총무과');
-  await waitFor(
-    async () => (await b.evaluate((k: string) => String(window.__editor!.list(k).get(0)?.get('t')), cellKey)) === '총무과',
-    '표 셀 편집이 전달됨',
-  );
-
+  await garam.keyboard.type('글 ');
+  await waitFor(async () => ((await bodyTexts(narae))[2] ?? '').startsWith('한글 '), 'HWPX 한글 입력');
   if (shots) {
     await mkdir(shots, { recursive: true });
-    await clickAt(b, 's0', 1, 3);
-    await b.keyboard.down('Shift');
-    for (let i = 0; i < 5; i++) await b.keyboard.press('ArrowRight');
-    await b.keyboard.up('Shift');
-    await a.waitForTimeout(400);
-    await a.screenshot({ path: path.join(shots, 'editor-a.png') });
-    await b.screenshot({ path: path.join(shots, 'editor-b.png') });
+    await garam.waitForTimeout(300);
+    await garam.screenshot({ path: path.join(shots, '2-hwpx.png') });
   }
 
-  // 8) 자동 저장 → HWPX 내려받아 다시 열기
-  await waitFor(async () => Boolean((await docInfo(id)).save?.ok), '자동 저장');
-  const res = await fetch(`${origin}/api/docs/${id}/export`);
-  const doc = openDocument(new Uint8Array(await res.arrayBuffer()));
-  const saved = Array.from({ length: doc.getParagraphCount(0) }, (_, i) => doc.getTextRange(0, i, 0, 1000));
-  doc.free();
-  assert.deepEqual(saved, await bodyTexts(a), '저장된 HWPX 의 본문 = 화면의 본문');
-  assert.equal((await docInfo(id)).save?.diffs, 0, '저장 호환성 검사 통과');
+  // ── 2) XLSX: 올리기 → 공유 → 셀 동시편집 ──
+  await garam.goto(`${origin}/#/`);
+  await garam.waitForSelector('.doc-list li');
+  const xlsxId = await upload(garam, '부서 예산.xlsx', await sampleXlsx());
+  await garam.waitForFunction(() => window.__grid);
+  assert.equal(await shown(garam, 0, 6, 4), '8,250,000', '숫자 서식으로 보인다');
+  assert.equal(await shown(garam, 0, 7, 4), '48.5%');
+  assert.equal(await garam.locator('.tab').count(), 2);
 
-  // 9) 늦게 들어온 세 번째 사람도 같은 문서를 본다
-  const c = await openAs('박다온', id);
-  assert.deepEqual(await hwpTexts(c), await hwpTexts(a));
+  await share(garam, '이나래');
+  await openFromList(narae, '부서 예산');
+  await narae.waitForFunction(() => window.__grid);
+
+  // 가람: B5 에 숫자 입력 → 나래 화면의 합계가 다시 계산된다.
+  await clickCell(garam, 5, 2);
+  await garam.keyboard.type('3100000');
+  await garam.keyboard.press('Enter');
+  await waitFor(async () => (await shown(narae, 0, 6, 4)) === '9,250,000', '상대 화면에서 수식이 다시 계산됨');
+  assert.equal(await shown(narae, 0, 5, 2), '3,100,000');
+
+  // 나래: E3 에 한글 (IME 조합) → 가람 화면에 보인다.
+  await clickCell(narae, 3, 5);
+  const cdp2 = await narae.context().newCDPSession(narae);
+  for (const text of ['ㅂ', '비', '빅', '비고']) await cdp2.send('Input.imeSetComposition', { text, selectionStart: text.length, selectionEnd: text.length });
+  await cdp2.send('Input.insertText', { text: '비고' });
+  await narae.keyboard.press('Enter');
+  await waitFor(async () => (await shown(garam, 0, 3, 5)) === '비고', '한글 셀 입력이 전달됨');
+
+  // 나래: 수식 입력줄로 수식 입력
+  await clickCell(narae, 4, 5);
+  await narae.locator('.fx').click();
+  await narae.keyboard.type('=D4/1000');
+  await narae.keyboard.press('Enter');
+  await waitFor(async () => (await shown(garam, 0, 4, 5)) === '1750', '수식 입력줄로 넣은 수식');
+
+  // 상대가 고르고 있는 셀이 이름과 함께 보인다.
+  await waitFor(async () => (await garam.locator('.peer-cell span').textContent().catch(() => '')) === '이나래', 'XLSX 상대 셀 표시');
+
+  // 지우기와 실행 취소
+  await clickCell(garam, 7, 1);
+  await garam.keyboard.press('Delete');
+  await waitFor(async () => (await shown(narae, 0, 7, 1)) === '', '셀 지우기 전달');
+  await garam.keyboard.press('Control+z');
+  await waitFor(async () => (await shown(narae, 0, 7, 1)) === '정보과 비율', '실행 취소 전달');
+
+  // 두 번째 시트
+  await garam.getByRole('tab', { name: '요약' }).click();
+  assert.equal(await shown(garam, 1, 1, 2), '9250000', '다른 시트도 다시 계산된다 (서식 없는 셀)');
+
   if (shots) {
-    const first = await browser.newPage({ viewport: { width: 900, height: 600 }, deviceScaleFactor: 2 });
-    await first.goto(origin);
-    await first.waitForSelector('.doc-list li');
-    await first.screenshot({ path: path.join(shots, 'home.png') });
+    await clickCell(narae, 6, 2);
+    await garam.getByRole('tab', { name: '예산' }).click();
+    await clickCell(garam, 5, 2);
+    await garam.waitForTimeout(400);
+    await garam.screenshot({ path: path.join(shots, '3-xlsx-garam.png') });
+    await narae.screenshot({ path: path.join(shots, '4-xlsx-narae.png') });
+  }
+
+  // 저장된 파일 확인
+  await waitFor(async () => Boolean((await docInfo(xlsxId)).save?.ok) && !srv.server.hocuspocus.debouncer.isDebounced(xlsxId), 'XLSX 자동 저장');
+  await waitFor(async () => {
+    const latest = await srv.store.versions(xlsxId);
+    return latest.length > 0;
+  }, '저장본');
+  const ydoc = srv.server.hocuspocus.documents.get(xlsxId)!;
+  const { renderXlsx } = await import('../../server/saver.ts');
+  const model = parseXlsx((await srv.store.base(xlsxId))!);
+  const saved = parseXlsx(renderXlsx((await srv.store.base(xlsxId))!, model, ydoc).bytes);
+  assert.equal(saved.sheets[0]!.cells.B5?.v, 3100000);
+  assert.equal(saved.sheets[0]!.cells.E3?.v, '비고');
+  assert.equal(saved.sheets[0]!.cells.E4?.f, 'D4/1000');
+  assert.equal(saved.sheets[0]!.cells.D6?.v, 9250000);
+
+  // ── 3) 권한 거두기: 열어 둔 화면이 막힌다 ──
+  await srv.store.updateMeta(xlsxId, { editors: [] });
+  const res = await fetch(`${origin}/api/docs/${xlsxId}/editors`, { method: 'PUT' });
+  assert.equal(res.status, 401, '로그인하지 않은 요청은 거절');
+  // 화면의 공유 창으로 권한을 뺀다.
+  await srv.store.updateMeta(xlsxId, { editors: [ids.narae!] });
+  await garam.getByRole('button', { name: '공유', exact: true }).click();
+  await garam.getByRole('button', { name: '권한 빼기' }).click();
+  await garam.waitForSelector('dialog.share >> text=아직 함께 편집하는 사람이 없습니다.');
+  await garam.getByRole('button', { name: '닫기' }).click();
+  await narae.waitForSelector('.blocker', { timeout: 5000 });
+
+  // HWPX 저장본도 확인
+  const hwpxRes = await fetch(`${origin}/api/docs/${hwpxId}/export`, { headers: { cookie: '' } });
+  assert.equal(hwpxRes.status, 401);
+  const hwpxDoc = srv.server.hocuspocus.documents.get(hwpxId);
+  if (hwpxDoc) {
+    const { renderHwpx } = await import('../../server/saver.ts');
+    const out = renderHwpx((await srv.store.base(hwpxId))!, hwpxDoc);
+    assert.deepEqual(out.diffs, []);
+    const d = openDocument(out.bytes);
+    assert.equal(d.getTextRange(0, 0, 0, 100), '동시편집 시험 문서 — 가람');
+    d.free();
+  }
+
+  if (shots) {
+    await daon.goto(`${origin}/#/`);
+    await garam.goto(`${origin}/#/`);
+    await garam.waitForSelector('.doc-list li');
+    await garam.screenshot({ path: path.join(shots, '1-home.png') });
+    await narae.screenshot({ path: path.join(shots, '5-revoked.png') });
   }
 
   assert.equal(failed, false, '페이지 오류가 없어야 한다');

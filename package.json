@@ -19,12 +19,16 @@
     "@hocuspocus/provider": "^4.8.0",
     "@hocuspocus/server": "^4.8.0",
     "@rhwp/core": "^0.9.0",
+    "@xmldom/xmldom": "^0.9.12",
     "express": "^5.3.0",
+    "fast-formula-parser": "^1.0.19",
+    "fflate": "^0.8.3",
     "yjs": "^13.6.33"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^22.20.5",
+    "exceljs": "^4.4.0",
     "typescript": "^7.0.2",
     "vite": "^8.3.8"
   }

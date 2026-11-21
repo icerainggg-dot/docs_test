@@ -1,7 +1,7 @@
-// HWPX 실시간 동시편집 서버.
-//   - REST  : 문서 올리기/목록/원본/내보내기/버전
-//   - WS    : Hocuspocus(Yjs) 동기화 — 같은 포트의 WebSocket 업그레이드
-//   - 저장  : 편집이 멈추면 원본 + Y 상태로 HWPX 를 다시 만들어 저장
+// 동시편집 서버 (HWPX·XLSX).
+//   - REST  : 로그인, 문서 올리기/목록/원본/내보내기/버전, 편집 권한 주기
+//   - WS    : Hocuspocus(Yjs) 동기화 — 같은 포트의 WebSocket 업그레이드, 문서 권한 확인
+//   - 저장  : 편집이 멈추면 원본 + Y 상태로 파일을 다시 만들어 저장
 
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -10,14 +10,21 @@ import type { AddressInfo } from 'node:net';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import * as Y from 'yjs';
+import { unzipSync } from 'fflate';
 import { Server } from '@hocuspocus/server';
 import { initRhwp, openDocument, blankHwpx } from '../src/shared/rhwp-node.ts';
 import { seedYDoc } from '../src/shared/model.ts';
+import { parseXlsx } from '../src/shared/xlsx/parse.ts';
+import { blankXlsx } from '../src/shared/xlsx/write.ts';
+import type { WorkbookModel } from '../src/shared/xlsx/types.ts';
 import { Store } from './store.ts';
-import type { SaveStatus } from './store.ts';
-import { renderHwpx } from './saver.ts';
+import type { DocKind, DocMeta, SaveStatus } from './store.ts';
+import { renderHwpx, renderXlsx } from './saver.ts';
 import { webdavFromEnv } from './webdav.ts';
 import type { WebDav } from './webdav.ts';
+import { UserStore, UserError } from './users.ts';
+import type { User } from './users.ts';
+import { authRouter, requireUser, checkOrigin, parseCookies, sameOrigin, COOKIE } from './auth.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -31,6 +38,10 @@ export interface ServerOptions {
   debounce?: number;
   /** 편집이 계속되어도 이 시간(ms)이 지나면 저장 */
   maxDebounce?: number;
+  /** 누구나 스스로 가입할 수 있는지 (기본: 환경변수 SIGNUP 이 closed 가 아니면 가능) */
+  signup?: boolean;
+  /** HTTPS 에서만 로그인 쿠키를 보낸다 (기본: 환경변수 COOKIE_SECURE=1) */
+  secureCookie?: boolean;
   log?: Logger;
 }
 
@@ -38,11 +49,40 @@ export interface CoeditServer {
   app: express.Express;
   server: Server;
   store: Store;
+  users: UserStore;
   listen(port?: number, host?: string): Promise<number>;
   close(): Promise<void>;
 }
 
+/** 실시간 접속마다 붙는 정보 */
+interface ConnContext {
+  userId: string;
+}
+
 const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+const MIME: Record<DocKind, string> = {
+  hwpx: 'application/hwp+zip',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+};
+
+export const canEdit = (meta: DocMeta, userId: string): boolean => meta.owner === userId || meta.editors.includes(userId);
+
+/** 올린 파일의 종류를 알아낸다. */
+function detectKind(bytes: Uint8Array, filename: string): DocKind {
+  if (/\.xls$/i.test(filename)) throw new UserError('예전 엑셀 형식(.xls)은 열 수 없습니다. 엑셀에서 .xlsx 로 저장한 뒤 올리세요.');
+  if (/\.(csv|ods|xlsm|xlsb)$/i.test(filename)) throw new UserError('XLSX 파일만 올릴 수 있습니다.');
+  // zip 이면서 xl/workbook.xml 이 있으면 XLSX
+  if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
+    try {
+      const names = Object.keys(unzipSync(bytes, { filter: (f) => f.name === 'xl/workbook.xml' }));
+      if (names.length) return 'xlsx';
+    } catch {
+      /* zip 이 아니면 한글 문서로 본다 */
+    }
+  }
+  return 'hwpx';
+}
 
 export async function createServer({
   dataDir = process.env.DATA_DIR || path.join(here, '..', 'data'),
@@ -50,34 +90,57 @@ export async function createServer({
   webdav = webdavFromEnv(),
   debounce = 2000,
   maxDebounce = 10000,
+  signup = process.env.SIGNUP !== 'closed',
+  secureCookie = process.env.COOKIE_SECURE === '1',
   log = console,
 }: ServerOptions = {}): Promise<CoeditServer> {
   await initRhwp();
   const store = new Store(dataDir);
+  const users = new UserStore(dataDir);
 
-  // Y 상태와 HWPX 저장본을 기록한다. 문서가 열려 있으면 살아 있는 Y 문서를 쓴다.
+  // XLSX 해석 결과는 문서마다 한 번만 읽는다.
+  const models = new Map<string, WorkbookModel>();
+  async function modelOf(id: string): Promise<WorkbookModel | null> {
+    const hit = models.get(id);
+    if (hit) return hit;
+    const json = await store.modelJson(id);
+    if (!json) return null;
+    const m = JSON.parse(json) as WorkbookModel;
+    models.set(id, m);
+    return m;
+  }
+
+  // Y 상태와 저장본을 기록한다. 문서가 열려 있으면 살아 있는 Y 문서를 쓴다.
   async function persist(id: string, ydoc: Y.Doc): Promise<Uint8Array | null> {
+    const meta = await store.meta(id);
     const base = await store.base(id);
-    if (!base) return null;
+    if (!meta || !base) return null;
     await store.saveYdoc(id, Y.encodeStateAsUpdate(ydoc));
     const save: SaveStatus = { at: new Date().toISOString(), ok: true, diffs: 0, webdav: null };
     let bytes: Uint8Array | null = null;
     try {
-      const out = renderHwpx(base, ydoc);
+      let out: { bytes: Uint8Array; diffs: unknown[] };
+      if (meta.kind === 'xlsx') {
+        const model = await modelOf(id);
+        if (!model) throw new Error('XLSX 해석 결과가 없습니다.');
+        out = renderXlsx(base, model, ydoc);
+      } else {
+        out = renderHwpx(base, ydoc);
+      }
       bytes = out.bytes;
       save.diffs = out.diffs.length;
       save.ok = out.diffs.length === 0;
       if (out.diffs.length) log.warn(`[저장 검사] ${id}: 불일치 ${out.diffs.length}건`, out.diffs.slice(0, 3));
-      await store.saveHwpx(id, bytes);
+      await store.saveFile(id, meta.kind, bytes);
     } catch (e) {
       save.ok = false;
       save.error = errorMessage(e);
       log.error(`[저장 실패] ${id}:`, e);
     }
-    const meta = await store.updateMeta(id, { updatedAt: save.at, save });
-    if (bytes && webdav && meta) {
+    const updated = await store.updateMeta(id, { updatedAt: save.at, save });
+    if (bytes && webdav && updated) {
       try {
-        save.webdav = await webdav.put(meta, bytes);
+        save.webdav = await webdav.put(updated, bytes);
       } catch (e) {
         save.webdav = errorMessage(e);
         log.warn(`[WebDAV] ${id}:`, save.webdav);
@@ -87,9 +150,24 @@ export async function createServer({
     return bytes;
   }
 
+  /** 권한이 빠진 사람의 실시간 접속을 끊는다. */
+  function kickUnauthorized(id: string, meta: DocMeta | null): void {
+    const doc = hocuspocus.documents.get(id);
+    if (!doc) return;
+    for (const conn of doc.getConnections()) {
+      const ctx = conn.context as ConnContext | undefined;
+      if (!meta || !ctx || !canEdit(meta, ctx.userId)) conn.close({ code: 4403, reason: 'Forbidden' });
+    }
+  }
+
   const app = express();
   app.disable('x-powered-by');
+  if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY);
+  app.use('/api', checkOrigin);
+  app.use('/api/auth', authRouter({ users, signup, secureCookie }));
+
   const api = express.Router();
+  api.use(requireUser(users));
   const asyncRoute =
     (fn: (req: Request, res: Response) => Promise<unknown>) =>
     (req: Request, res: Response, next: NextFunction): void => {
@@ -98,109 +176,188 @@ export async function createServer({
   const notFound = (res: Response, what = '문서를'): void => {
     res.status(404).json({ error: `${what} 찾을 수 없습니다.` });
   };
-  /** 경로의 문서 id (api.param 에서 형식을 이미 검사했다) */
-  const docId = (req: Request): string => String(req.params.id);
+  const me = (req: Request): User => req.user!;
 
-  api.param('id', (req, res, next, id) => {
-    if (!Store.isId(id)) return notFound(res);
-    next();
-  });
+  /** 경로의 문서를 읽고 권한을 확인한다. 권한이 없으면 문서가 없는 것처럼 답한다. */
+  async function docFor(req: Request, res: Response, { ownerOnly = false } = {}): Promise<DocMeta | null> {
+    const id = String(req.params.id);
+    const meta = Store.isId(id) ? await store.meta(id) : null;
+    if (!meta || !canEdit(meta, me(req).id)) {
+      notFound(res);
+      return null;
+    }
+    if (ownerOnly && meta.owner !== me(req).id) {
+      res.status(403).json({ error: '문서를 올린 사람만 할 수 있습니다.' });
+      return null;
+    }
+    return meta;
+  }
 
-  api.get('/docs', asyncRoute(async (req, res) => {
-    res.json(await store.list());
+  /** 화면에 보낼 문서 정보 (소유자·편집자 이름 포함) */
+  async function docView(meta: DocMeta, userId: string): Promise<object> {
+    const people = await users.getMany([meta.owner, ...meta.editors]);
+    const byId = new Map(people.map((u) => [u.id, { id: u.id, username: u.username, name: u.name }]));
+    return {
+      ...meta,
+      role: meta.owner === userId ? 'owner' : 'editor',
+      ownerUser: byId.get(meta.owner) ?? null,
+      editorUsers: meta.editors.map((id) => byId.get(id)).filter(Boolean),
+    };
+  }
+
+  api.get('/users', asyncRoute(async (req, res) => {
+    const q = String(req.query.q ?? '').slice(0, 50);
+    const found = await users.search(q);
+    res.json(found.filter((u) => u.id !== me(req).id).map((u) => ({ id: u.id, username: u.username, name: u.name })));
   }));
 
-  // 문서 만들기: 본문에 HWP/HWPX 바이트를 실어 보내면 그 문서로, 비어 있으면 빈 문서로 시작한다.
+  api.get('/docs', asyncRoute(async (req, res) => {
+    const uid = me(req).id;
+    const mine = (await store.list()).filter((m) => canEdit(m, uid));
+    res.json(await Promise.all(mine.map((m) => docView(m, uid))));
+  }));
+
+  // 문서 만들기: 본문에 파일 바이트를 실어 보내면 그 문서로, 비어 있으면 ?kind= 의 빈 문서로 시작한다.
   api.post('/docs', express.raw({ type: () => true, limit: '100mb' }), asyncRoute(async (req, res) => {
     const filename = String(req.query.filename || '').slice(0, 200);
     const body: unknown = req.body;
-    const base = Buffer.isBuffer(body) && body.length ? new Uint8Array(body) : blankHwpx();
+    const uploaded = Buffer.isBuffer(body) && body.length ? new Uint8Array(body) : null;
+    let kind: DocKind;
+    try {
+      kind = uploaded ? detectKind(uploaded, filename) : req.query.kind === 'xlsx' ? 'xlsx' : 'hwpx';
+    } catch (e) {
+      res.status(400).json({ error: errorMessage(e) });
+      return;
+    }
+    const base = uploaded ?? (kind === 'xlsx' ? blankXlsx() : blankHwpx());
     let title = String(req.query.title || '').trim().slice(0, 200);
-    if (!title) title = filename.replace(/\.(hwpx?|hml)$/i, '') || '새 문서';
+    if (!title) title = filename.replace(/\.(hwpx?|hml|xlsx)$/i, '') || (kind === 'xlsx' ? '새 통합 문서' : '새 문서');
 
     const ydoc = new Y.Doc();
-    let hwp;
+    let model: WorkbookModel | undefined;
     try {
-      hwp = openDocument(base);
+      if (kind === 'xlsx') {
+        model = parseXlsx(base);
+      } else {
+        const hwp = openDocument(base);
+        try {
+          seedYDoc(ydoc, hwp);
+        } finally {
+          hwp.free();
+        }
+      }
     } catch (e) {
       res.status(400).json({ error: `문서를 열 수 없습니다: ${errorMessage(e)}` });
       return;
     }
-    try {
-      seedYDoc(ydoc, hwp);
-    } finally {
-      hwp.free();
-    }
-    const meta = await store.create({ title, filename, base, ydocUpdate: Y.encodeStateAsUpdate(ydoc) });
-    res.status(201).json(meta);
+    const meta = await store.create({
+      kind,
+      title,
+      filename,
+      owner: me(req).id,
+      base,
+      ydocUpdate: Y.encodeStateAsUpdate(ydoc),
+      model,
+    });
+    if (model) models.set(meta.id, model);
+    res.status(201).json(await docView(meta, me(req).id));
   }));
 
   api.get('/docs/:id', asyncRoute(async (req, res) => {
-    const id = docId(req);
-    const meta = await store.meta(id);
-    if (!meta) return notFound(res);
-    res.json({ ...meta, versions: await store.versions(id) });
+    const meta = await docFor(req, res);
+    if (!meta) return;
+    res.json({ ...(await docView(meta, me(req).id)), versions: await store.versions(meta.id) });
   }));
 
   api.patch('/docs/:id', express.json(), asyncRoute(async (req, res) => {
+    const meta = await docFor(req, res, { ownerOnly: true });
+    if (!meta) return;
     const body = req.body as { title?: unknown } | undefined;
     const title = String(body?.title || '').trim().slice(0, 200);
     if (!title) {
       res.status(400).json({ error: '제목이 비어 있습니다.' });
       return;
     }
-    const meta = await store.updateMeta(docId(req), { title });
-    if (!meta) return notFound(res);
-    res.json(meta);
+    const updated = await store.updateMeta(meta.id, { title });
+    res.json(await docView(updated!, me(req).id));
+  }));
+
+  // 편집 권한 주기: 올린 사람이 편집자 목록을 통째로 정한다.
+  api.put('/docs/:id/editors', express.json(), asyncRoute(async (req, res) => {
+    const meta = await docFor(req, res, { ownerOnly: true });
+    if (!meta) return;
+    const body = req.body as { userIds?: unknown } | undefined;
+    const ids = Array.isArray(body?.userIds) ? body.userIds.filter((x): x is string => typeof x === 'string') : null;
+    if (!ids) {
+      res.status(400).json({ error: 'userIds 가 필요합니다.' });
+      return;
+    }
+    const known = await users.getMany(ids);
+    const editors = [...new Set(known.map((u) => u.id))].filter((id) => id !== meta.owner).slice(0, 200);
+    const updated = await store.updateMeta(meta.id, { editors });
+    kickUnauthorized(meta.id, updated);
+    res.json(await docView(updated!, me(req).id));
   }));
 
   api.delete('/docs/:id', asyncRoute(async (req, res) => {
-    const id = docId(req);
-    hocuspocus.closeConnections(id);
-    await store.remove(id);
+    const meta = await docFor(req, res, { ownerOnly: true });
+    if (!meta) return;
+    kickUnauthorized(meta.id, null);
+    models.delete(meta.id);
+    await store.remove(meta.id);
     res.status(204).end();
   }));
 
   api.get('/docs/:id/base', asyncRoute(async (req, res) => {
-    const bytes = await store.base(docId(req));
+    const meta = await docFor(req, res);
+    if (!meta) return;
+    const bytes = await store.base(meta.id);
     if (!bytes) return notFound(res);
     res.set('Cache-Control', 'private, max-age=31536000, immutable');
     res.type('application/octet-stream').send(Buffer.from(bytes));
   }));
 
-  const sendHwpx = (res: Response, title: string, bytes: Uint8Array): void => {
-    res.set('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(title)}.hwpx`);
+  api.get('/docs/:id/model', asyncRoute(async (req, res) => {
+    const meta = await docFor(req, res);
+    if (!meta) return;
+    const json = meta.kind === 'xlsx' ? await store.modelJson(meta.id) : null;
+    if (!json) return notFound(res, 'XLSX 정보를');
+    res.set('Cache-Control', 'private, max-age=31536000, immutable');
+    res.type('application/json').send(json);
+  }));
+
+  const sendFile = (res: Response, kind: DocKind, title: string, bytes: Uint8Array): void => {
+    res.set('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(title)}.${kind}`);
     res.set('Cache-Control', 'no-store');
-    res.type('application/hwp+zip').send(Buffer.from(bytes));
+    res.type(MIME[kind]).send(Buffer.from(bytes));
   };
 
-  // 지금 상태를 HWPX 로 내려받는다.
+  // 지금 상태를 파일로 내려받는다.
   api.get('/docs/:id/export', asyncRoute(async (req, res) => {
-    const id = docId(req);
-    const meta = await store.meta(id);
-    if (!meta) return notFound(res);
-    let ydoc: Y.Doc | undefined = hocuspocus.documents.get(id);
+    const meta = await docFor(req, res);
+    if (!meta) return;
+    let ydoc: Y.Doc | undefined = hocuspocus.documents.get(meta.id);
     if (!ydoc) {
-      const update = await store.ydoc(id);
+      const update = await store.ydoc(meta.id);
       if (!update) return notFound(res);
       ydoc = new Y.Doc();
       Y.applyUpdate(ydoc, update);
     }
-    const bytes = await persist(id, ydoc);
+    const bytes = await persist(meta.id, ydoc);
     if (!bytes) {
-      res.status(500).json({ error: 'HWPX 를 만들지 못했습니다.' });
+      res.status(500).json({ error: '파일을 만들지 못했습니다.' });
       return;
     }
-    sendHwpx(res, meta.title, bytes);
+    sendFile(res, meta.kind, meta.title, bytes);
   }));
 
   api.get('/docs/:id/versions/:name', asyncRoute(async (req, res) => {
-    const id = docId(req);
+    const meta = await docFor(req, res);
+    if (!meta) return;
     const name = String(req.params.name);
-    const meta = await store.meta(id);
-    const bytes = meta && (await store.version(id, name));
-    if (!meta || !bytes) return notFound(res, '저장본을');
-    sendHwpx(res, `${meta.title} ${name.replace('.hwpx', '')}`, bytes);
+    const bytes = await store.version(meta.id, name);
+    if (!bytes) return notFound(res, '저장본을');
+    sendFile(res, meta.kind, `${meta.title} ${name.replace(/\.(hwpx|xlsx)$/, '')}`, bytes);
   }));
 
   app.use('/api', api);
@@ -217,8 +374,12 @@ export async function createServer({
   }
 
   app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
-    log.error(err);
     if (res.headersSent) return next(err);
+    if (err instanceof UserError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    log.error(err);
     const e = err as { status?: number; type?: string };
     res.status(e.status || 500).json({ error: e.type === 'entity.too.large' ? '파일이 너무 큽니다.' : '서버 오류' });
   });
@@ -229,11 +390,13 @@ export async function createServer({
     debounce,
     maxDebounce,
 
-    // 없는 문서로의 접속은 받지 않는다.
-    async onConnect({ documentName }) {
-      if (!Store.isId(documentName) || !(await store.meta(documentName))) {
-        throw new Error('문서를 찾을 수 없습니다.');
-      }
+    // 로그인 쿠키로 사람을 확인하고, 그 문서의 편집 권한이 있는지 본다.
+    async onAuthenticate({ documentName, requestHeaders }): Promise<ConnContext> {
+      if (!sameOrigin(requestHeaders.get('origin'), requestHeaders.get('host'))) throw new Error('Forbidden');
+      const user = await users.userForToken(parseCookies(requestHeaders.get('cookie'))[COOKIE]);
+      const meta = user && Store.isId(documentName) ? await store.meta(documentName) : null;
+      if (!user || !meta || !canEdit(meta, user.id)) throw new Error('Forbidden');
+      return { userId: user.id };
     },
 
     async onLoadDocument({ documentName, document }) {
@@ -261,9 +424,12 @@ export async function createServer({
     app,
     server,
     store,
+    users,
     async listen(port = Number(process.env.PORT) || 8787, host = process.env.HOST || '0.0.0.0') {
       server.configuration.address = host;
-      await server.listen(port);
+      // listen(0) 은 0 을 무시하므로 설정에 직접 넣는다 (0 = 빈 포트 자동 선택).
+      server.configuration.port = port;
+      await server.listen();
       return (server.httpServer.address() as AddressInfo).port;
     },
     async close() {
@@ -276,7 +442,10 @@ export async function createServer({
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const srv = await createServer();
   const port = await srv.listen();
-  console.log(`HWPX 동시편집 서버: http://localhost:${port}`);
+  console.log(`동시편집 서버: http://localhost:${port}`);
+  if ((await srv.users.count()) === 0) {
+    console.log('아직 계정이 없습니다. 화면에서 가입하거나 `node scripts/users.ts add <아이디> <이름> <암호>` 로 만드세요.');
+  }
   const stop = async (): Promise<void> => {
     await srv.close();
     process.exit(0);

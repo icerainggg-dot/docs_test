@@ -153,15 +153,48 @@ input {
 .doc-list li:first-child {
   border-top: 0;
 }
+.doc-main {
+  flex: 1 1 220px;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
 .doc-title {
-  flex: 1 1 200px;
   font-weight: 600;
   text-decoration: none;
   overflow-wrap: anywhere;
 }
-.doc-time {
+.doc-sub {
   color: var(--muted);
   font-size: 13px;
+}
+.doc-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.kind {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.kind-hwpx {
+  background: color-mix(in srgb, #1971c2 15%, transparent);
+  color: #1971c2;
+}
+.kind-xlsx {
+  background: color-mix(in srgb, #2f9e44 15%, transparent);
+  color: #2f9e44;
+}
+@media (prefers-color-scheme: dark) {
+  .kind-hwpx {
+    color: #74c0fc;
+  }
+  .kind-xlsx {
+    color: #8ce99a;
+  }
 }
 .doc-list .empty {
   color: var(--muted);
@@ -404,4 +437,382 @@ input {
 }
 .flash.show {
   opacity: 1;
+}
+
+/* ── 로그인 ── */
+.login {
+  max-width: 400px;
+  margin: 0 auto;
+  padding: 56px 16px;
+}
+.brand {
+  margin: 0 0 12px;
+  font-weight: 700;
+  color: var(--muted);
+}
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.login-form h1 {
+  margin: 0;
+  font-size: 22px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.field[hidden] {
+  display: none;
+}
+.field label {
+  font-size: 13px;
+  color: var(--muted);
+}
+.field input {
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.linklike {
+  align-self: flex-start;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* ── 첫 화면 머리 ── */
+.home-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.me {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+/* ── 공유 창 ── */
+dialog.share {
+  width: min(520px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--ink);
+}
+dialog.share::backdrop {
+  background: rgba(0, 0, 0, 0.35);
+}
+dialog.share h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+}
+.members,
+.results {
+  list-style: none;
+  margin: 12px 0;
+  padding: 0;
+}
+.members li,
+.results li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+.members li:first-child,
+.results li:first-child {
+  border-top: 0;
+}
+.who {
+  flex: 1 1 160px;
+  color: var(--muted);
+}
+.who b {
+  color: var(--ink);
+}
+.note {
+  color: var(--muted);
+  font-size: 13px;
+}
+.search input {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+dialog.share .actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+.empty {
+  color: var(--muted);
+}
+
+/* ── 권한을 잃었을 때 ── */
+.blocker {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 10;
+}
+.blocker .card {
+  text-align: center;
+}
+
+/* ── 엑셀 화면 ── */
+.sheet {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  --gridline: #e3e6ea;
+  --head: #f4f5f7;
+}
+@media (prefers-color-scheme: dark) {
+  .sheet {
+    --head: #2a2e34;
+  }
+}
+.fbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.fbar .addr {
+  width: 96px;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  font-variant-numeric: tabular-nums;
+}
+.fx-label {
+  color: var(--muted);
+  font-style: italic;
+}
+.fbar .fx {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+}
+.grid {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 46px 1fr;
+  grid-template-rows: 24px 1fr;
+  background: var(--panel);
+}
+.corner,
+.colhead,
+.rowhead {
+  background: var(--head);
+  overflow: hidden;
+  position: relative;
+  font-size: 12px;
+  color: var(--muted);
+  user-select: none;
+}
+.corner {
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+.colhead {
+  border-bottom: 1px solid var(--line);
+}
+.rowhead {
+  border-right: 1px solid var(--line);
+}
+.colhead .inner,
+.rowhead .inner {
+  position: absolute;
+  inset: 0;
+}
+.hc,
+.hr {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: inset -1px -1px 0 var(--line);
+}
+.hc {
+  top: 0;
+  height: 24px;
+}
+.hr {
+  left: 0;
+  width: 46px;
+  font-variant-numeric: tabular-nums;
+}
+.hc.on,
+.hr.on {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--ink);
+  font-weight: 600;
+}
+.gbody {
+  position: relative;
+  overflow: auto;
+  outline: none;
+  cursor: cell;
+  touch-action: pan-x pan-y;
+}
+.canvas {
+  position: relative;
+  background: #fff;
+}
+.cells {
+  position: absolute;
+  inset: 0;
+  color: #111;
+  font-family: '맑은 고딕', 'Malgun Gothic', 'Noto Sans KR', 'Apple SD Gothic Neo', sans-serif;
+  font-size: 14.7px;
+}
+.cells .c {
+  position: absolute;
+  display: flex;
+  align-items: flex-end;
+  padding: 0 3px 1px;
+  overflow: hidden;
+  white-space: pre;
+  line-height: 1.25;
+  box-shadow: inset -1px -1px 0 var(--gridline);
+}
+.cells .c > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+.cells .c.m {
+  background: #fff;
+  z-index: 1;
+}
+.cells .a-right > span {
+  text-align: right;
+}
+.cells .a-center > span {
+  text-align: center;
+}
+.sel-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+.sel-layer > div {
+  position: absolute;
+}
+.my-range {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  outline: 1px solid var(--accent);
+}
+.my-cell {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+.peer-range {
+  background: color-mix(in srgb, var(--c) 10%, transparent);
+}
+.peer-cell {
+  outline: 2px solid var(--c);
+  outline-offset: -1px;
+}
+.peer-cell.editing {
+  outline-style: dashed;
+}
+.peer-cell span {
+  position: absolute;
+  right: -2px;
+  bottom: 100%;
+  padding: 0 5px;
+  border-radius: 3px 3px 0 3px;
+  background: var(--c);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.cell-editor {
+  position: absolute;
+  z-index: 3;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 1px 3px;
+  border: 0;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  white-space: pre;
+  font: inherit;
+  font-family: '맑은 고딕', 'Malgun Gothic', 'Noto Sans KR', sans-serif;
+  font-size: 14.7px;
+  line-height: 1.25;
+  color: transparent;
+  background: transparent;
+  caret-color: transparent;
+}
+.cell-editor.editing {
+  color: #111;
+  background: #fff;
+  caret-color: #111;
+  outline: 2px solid var(--accent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 8px;
+  background: var(--head);
+  border-top: 1px solid var(--line);
+  overflow-x: auto;
+  flex: none;
+}
+.tab {
+  padding: 6px 14px;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  background: none;
+  cursor: pointer;
+  white-space: nowrap;
+  color: var(--muted);
+}
+.tab[aria-selected='true'] {
+  color: var(--ink);
+  font-weight: 700;
+  background: var(--panel);
+  border-bottom-color: #2f9e44;
 }
